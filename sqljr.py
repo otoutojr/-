@@ -959,7 +959,7 @@ def test_union(ctx):
                     tries += [[(cv % mark(i)) if i == j else "NULL" for i in range(cols)] for j in range(cols)]
                 for exprs in tries:
                     r = send(pt, "%s UNION ALL SELECT %s%s%s" % (pre, ",".join(exprs), frm, cm), base)
-                    if r.bad:
+                    if r.bad or ctx.new_db(r):      # 型エラーの文面に目印が出ただけ、を表示列と誤認しない
                         continue
                     vis = [i for i in range(cols) if (TAG + mark(i)) in r.body]
                     if vis:

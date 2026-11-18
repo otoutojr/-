@@ -24,24 +24,64 @@ python3 sqljr.py -u "http://victim/item?id=1" -o result.json --log req.jsonl
 
 ## --risk（どこまで送るか）
 
-| | 送るもの |
+| | GET / HEAD | それ以外（POST など） |
+|---|---|---|
+| `--risk 1`（既定） | AND 型、値を変えない式、コメント（`-- -` / `#`）、`ORDER BY`、`UNION`、MSSQL の `WAITFOR` | **値を変えない式**と、クォートを閉じ直す AND だけ |
+| `--risk 2` | 上に加えて OR 型、PostgreSQL のスタッククエリ、SQLite の `RANDOMBLOB` 負荷 | GET の `--risk 2` と同じものを全部 |
+
+既定で GET 以外に送らないものと、その理由です。どれも、注入先が `UPDATE` / `DELETE` だったときに狙った行以外へ効きます。
+
+| 送らないもの | 送るとどうなるか |
 |---|---|
-| `--risk 1`（既定） | AND 型と、式に埋め込む型だけ。GET 以外のリクエストでは、コメント（`-- -`）で後続の SQL を消すペイロード（UNION、MSSQL の `WAITFOR` を含む）を送らない |
-| `--risk 2` | 上に加えて OR 型、スタッククエリ、GET 以外でのコメント、SQLite の大きい負荷 |
+| コメント（`' AND 1=1-- -`）、`UNION`、`ORDER BY`、`WAITFOR` | `UPDATE … SET x='入力' WHERE id=2` の `WHERE` が消えて全行が書き換わる |
+| `';` | PHP の PDO / SQLite3 のように `;` の手前までを実行する実装で、`WHERE` の無い `UPDATE` が走る |
+| OR 型 | `WHERE` が常に真になり全行に効く |
+| 接頭辞なしの AND（`3 AND 1=1`） | `DELETE … WHERE id IN (3 AND 1=1)` は `IN (1)` になり、別の ID の行が消える |
 
-理由: 注入先が `UPDATE … SET x='入力' WHERE id=…` のとき、`' AND 1=1-- -` は `WHERE` を消して全行を書き換えます。`OR` も同じです。既定ではこれを避けます。
+代わりに「値を変えない式」を使います。条件が真なら元の値のまま、偽なら SQL エラーになる形です。
 
-- ログインフォーム（元値が無効な入力）は OR 型でないと boolean では検出できません。`--risk 2` を付けてください。
-- 検索など参照系と分かっている POST も `--risk 2` で UNION まで調べられます。
-- GET は参照系とみなして全部送ります。GET で更新する作りの対象には注意してください。
-- 登録・更新系のエンドポイントは、どの risk でも検査のたびに行が書き込まれます。
+```
+数値   3-(CASE WHEN (条件) THEN 0 ELSE (複数行の副問い合わせ) END)
+文字列 abc'||(SELECT CASE WHEN (条件) THEN '' ELSE (複数行の副問い合わせ) END)||'
+```
+
+これで分かるのは「条件が偽のときにエラーになるか」なので、SQL エラーが画面にもステータスにも出ない対象では boolean を検出できません。time は同じ形に遅延を埋め込んで調べます。
+
+注意点:
+
+- ログインフォーム（元値が無効な入力）は OR 型でないと boolean では検出できないことが多いです。`--risk 2` を付けてください。
+- 検索など参照系と分かっている POST も、`--risk 2` で UNION まで調べられます。
+- GET で更新・削除する作りの対象には使わないでください。GET にはコメントも送るので、入力が `SET` 句に入る `UPDATE` だと全行が書き換わります。
+- 登録・更新系のエンドポイントは、どの risk でも検査のたびに行が書き込まれます（狙った行は更新・削除されます）。
+- 既定でも残る危険: MySQL / MariaDB で、文字列の値が `IN ('入力')` の中に入る `UPDATE` / `DELETE`。`'x' AND 1=1 …` も `'x'||…` も数値の 0 として評価され、数字でない文字列の全行に一致します。書き込み系のエンドポイントは、壊れてもよい環境で検査してください。
+- 提示するコマンドも同じ基準です。GET 以外・`--risk 1` では、コメントで後続を消す形（UNION、スタッククエリ、認証バイパス）は提示しません。
 
 ## 検出できる文脈
 
-- WHERE 句（数値、`'`、`"`、括弧付き）
-- ORDER BY / GROUP BY の後ろ
+- WHERE 句（数値、`'`、`"`、括弧付き、`IN (…)` の中の数値）
+- ORDER BY の後ろ（5 種類の DBMS すべて）、GROUP BY の後ろ（MySQL / PostgreSQL / SQLite / Oracle。MSSQL は GET のときの time だけ）
 - INSERT / UPDATE の文字列値（User-Agent をログに INSERT する作りなど。`--level 3`）
-- 注入点: GET、POST フォーム、JSON、Cookie（`--level 2`）、ヘッダ（`--level 3`）、パス、`*` を置いた生ボディ
+- 元の値が 1 行も返さない WHERE（検索語がヒットしない等）。boolean は式の形で調べ、GET なら UNION まで進みます
+- 注入点: GET、POST フォーム、JSON、Cookie（`--level 2`）、ヘッダ（`--level 3`）、パス、`*` を置いた生ボディ（XML など）
+
+time-based の遅延手段:
+
+| DBMS | 手段 |
+|---|---|
+| MySQL / MariaDB | `SLEEP`（派生テーブルに入れて 1 文につき 1 回） |
+| PostgreSQL | `PG_SLEEP` |
+| MSSQL | `WAITFOR DELAY`（スタッククエリ。GET か `--risk 2` のときだけ） |
+| Oracle | `DBMS_PIPE.RECEIVE_MESSAGE`。実行権限が無ければ重い問い合わせ（`ALL_USERS` の直積を数える）で代用 |
+| SQLite | 再帰 CTE で数える（CPU のみ）。`--risk 2` では `RANDOMBLOB` も試す（100MB で対象のメモリを約 700MB 使う） |
+
+Cookie は、まず URL エンコードした形で調べ、確定できなければエンコードせずにもう一度調べます（Cookie の値をデコードしない実装があるため）。
+
+## 結果の確からしさ
+
+- **確定**（`[+] 注入点あり`）: boolean / time / UNION のどれかが通った、または DBMS 固有のエラー文が出た。
+- **未確定**（`[?] 注入の可能性あり`）: `'` で壊れて `''` で直る、あるいは `syntax error` のような DBMS を特定できない文言が出ただけ。SQL 以外の構文解析器でも同じ挙動になります。
+
+UNION は、`UNION ALL SELECT NULL,…` の列数を変えると応答が変わること、または目印の文字列が画面に出ることを確かめてから報告します。`ORDER BY n` の挙動だけでは報告しません。
 
 ## 検出できないもの
 
@@ -49,14 +89,26 @@ python3 sqljr.py -u "http://victim/item?id=1" -o result.json --log req.jsonl
 
 - 二次 SQL injection（保存された値が後で使われる型）
 - base64 などで包まれた値、multipart（`*` を置いた箇所のみ）
+- SQL エラーが応答に一切影響せず、遅延もさせられない注入点
 - 改行をまたぐ SQL での UNION と MSSQL の time（行コメントでは次の行を消せない）
-- MSSQL の ORDER BY 句での boolean、MSSQL の INSERT / UPDATE 値での time
+- MSSQL の GROUP BY 句での boolean、Oracle の GROUP BY 句での time（どちらも副問い合わせを書けない場所）
+- MSSQL の INSERT / UPDATE 値での time（式の中で遅延できない）
+- PostgreSQL / Oracle のログインフォームの boolean は `--risk 2` が必要（パスワード側の条件が先に評価され、埋め込んだ式が実行されない）
+- Oracle / SQLite の time は「重い処理」なので、対象が速いと閾値（0.5 秒）に届かず見逃すことがあります
 - WAF 越し。遮断（403 / 406 / 429 / 503）を検知したら警告しますが、回避は `--tamper` の最低限だけです
+
+## 知っておくとよい挙動
+
+- 応答の `Set-Cookie` は保持しません。検査の途中でログイン状態が変わると結果が狂うためです。セッションが要るページは `-c` で渡してください。
+- `*`（`--marker` で変更可）がどこかにあると、その位置だけを検査します。`*` がデータの一部なら `--marker §` のように別の文字を指定してください。URL エンコードされた `%2A` はマーカー扱いしません。
+- 検査しないパラメータは、受け取ったバイト列のまま送ります（UTF-8 以外でエンコードされた値や `;jsessionid=…` も変えません）。
+- `--proxy` は環境変数 `http_proxy` / `https_proxy` より優先します。
+- 提示する curl コマンドは、sqljr が送ったリクエストと同じになるようにしています（User-Agent も含む）。
 
 ## 出力
 
-- `-o result.json`: 注入点ごとの手法、DBMS、閉じ方、提示コマンド、検出の根拠になったリクエストと応答
-- `--log req.jsonl`: 送った全リクエスト（時刻、URL、ボディ、ステータス、応答長、所要時間）
+- `-o result.json`: 注入点ごとの手法、確からしさ（`confidence`）、DBMS、閉じ方、提示コマンド、検出の根拠になったリクエストと応答
+- `--log req.jsonl`: 送った全リクエスト。1 回の送信につき 1 行（時刻、注入点、ペイロード、URL、ヘッダ、ボディ、ステータス、応答長、所要時間）
 
 ## テスト
 
@@ -64,7 +116,7 @@ python3 sqljr.py -u "http://victim/item?id=1" -o result.json --log req.jsonl
 python3 -m unittest discover -s tests -v
 ```
 
-`tests/vuln_app.py`（わざと脆弱にしたアプリ）を SQLite で起動して検査します。追加の準備は要りません。
+`tests/vuln_app.py`（わざと脆弱にしたアプリ）を SQLite で起動して検査します。追加の準備は要りません。書き込み系のエンドポイントを既定の risk で検査して、狙った行以外が変わらないことも確かめます。
 
 他の DBMS で同じテストを回す場合は、アプリを起動してから URL と DBMS 名を渡します。
 
@@ -73,4 +125,4 @@ VULN_MSSQL_PASSWORD='...' python3 tests/vuln_app.py mssql 8104 &
 SQLJR_TEST_URL=http://127.0.0.1:8104 SQLJR_TEST_DBMS=MSSQL python3 -m unittest discover -s tests -v
 ```
 
-`vuln_app.py` のバックエンドは `sqlite` / `pg` / `mysql` / `mssql` / `oracle` です。接続先は `VULN_*` 環境変数で指定します（ファイル冒頭を参照）。ドライバは `psycopg2-binary` / `pymysql` / `pymssql` / `oracledb` です。
+`vuln_app.py` のバックエンドは `sqlite` / `pg` / `mysql` / `mssql` / `oracle` です。接続先は `VULN_*` 環境変数で指定します（ファイル冒頭を参照）。ドライバは `psycopg2-binary` / `pymysql` / `pymssql` / `oracledb` です。Oracle は DBA ではない一般ユーザ（`VULN_ORACLE_USER`）でも回してください。`DBMS_PIPE` を使えない状況になります。

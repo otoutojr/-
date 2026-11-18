@@ -11,6 +11,7 @@ import html
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,17 +21,22 @@ KIND = sys.argv[1] if len(sys.argv) > 1 else "sqlite"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8101
 SQLITE_PATH = os.environ.get("VULN_SQLITE_PATH") or os.path.join(tempfile.gettempdir(), "sqljr_vuln_%d.db" % PORT)
 
-SETUP = [
-    "DROP TABLE IF EXISTS items", "DROP TABLE IF EXISTS users",
-    "DROP TABLE IF EXISTS logs", "DROP TABLE IF EXISTS notes",
+TABLES = ["items", "users", "logs", "notes", "products", "sessions"]
+SETUP = ["DROP TABLE IF EXISTS %s" % t for t in TABLES] + [
     "CREATE TABLE items (id INT, name VARCHAR(50), price INT)",
     "CREATE TABLE users (id INT, username VARCHAR(50), password VARCHAR(50))",
     "CREATE TABLE logs (a VARCHAR(400), b VARCHAR(400))",
     "CREATE TABLE notes (id INT, body VARCHAR(400))",
+    "CREATE TABLE products (id INT, name VARCHAR(50), price INT, cat INT)",
+    "CREATE TABLE sessions (token VARCHAR(50), owner INT)",
     "INSERT INTO items VALUES (1,'apple',100),(2,'banana',200),(3,'cherry',300)",
-    "INSERT INTO users VALUES (1,'admin','s3cret'),(2,'alice','pw')",
-    "INSERT INTO notes VALUES (1,'first'),(2,'second')",
+    "INSERT INTO users VALUES (1,'admin','s3cret'),(2,'alice','pw'),(3,'bob','hunter2'),(4,'carol','qwerty')",
+    "INSERT INTO notes VALUES (1,'first'),(2,'second'),(3,'third'),(4,'fourth'),(5,'fifth')",
+    # 列ごとに並び順が違う一覧（ORDER BY 1 / 2 / 3 で行の順番が変わる）
+    "INSERT INTO products VALUES (1,'pear',300,1),(2,'apple',100,1),(3,'melon',900,1),(4,'kiwi',50,2)",
+    "INSERT INTO sessions VALUES ('tok-admin',1),('tok-alice',2),('tok-bob',3)",
 ]
+ORDER = {"items": "id", "users": "id", "notes": "id", "products": "id", "sessions": "token", "logs": "a"}
 
 
 def connect():
@@ -82,19 +88,64 @@ def q(sql, args=None):
         c.close()
 
 
-for stmt in SETUP:
-    q(stmt)
+def q_multi(sql):
+    """「; で区切った先頭の文は実行してしまう」実装のまね（PHP の PDO::query / SQLite3::exec、MySQL の multi_query）。
+       sqlite と mysql だけ。ほかの DBMS は文全体を構文エラーとして拒否するので通常の実行と同じ。"""
+    if KIND == "sqlite":
+        c = connect()
+        try:
+            c.executescript(sql)
+        finally:
+            c.close()
+        return []
+    if KIND == "mysql":
+        import pymysql
+        from pymysql.constants import CLIENT
+        c = pymysql.connect(unix_socket=os.environ.get("VULN_MYSQL_SOCKET", "/run/mysqld/mysqld.sock"),
+                            user=os.environ.get("VULN_MYSQL_USER", "root"),
+                            password=os.environ.get("VULN_MYSQL_PASSWORD", ""),
+                            database=os.environ.get("VULN_MYSQL_DB", "t"), autocommit=True,
+                            client_flag=CLIENT.MULTI_STATEMENTS)
+        try:
+            c.cursor().execute(sql)
+        finally:
+            c.close()
+        return []
+    return q(sql)
+
+
+def setup():
+    for stmt in SETUP:
+        if KIND == "oracle" and stmt.startswith("DROP"):
+            try:
+                q(stmt.replace(" IF EXISTS", ""))
+            except Exception:
+                pass
+        elif KIND == "oracle" and stmt.startswith("INSERT") and "),(" in stmt:
+            head, _, vals = stmt.partition(" VALUES ")
+            for v in vals[1:-1].split("),("):          # 古い Oracle は複数行の VALUES を書けない
+                q("%s VALUES (%s)" % (head, v))
+        else:
+            q(stmt)
+
+
+setup()
+SESSIONS = set()            # /slogin が発行したセッション Cookie
 
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def out(self, code, body, loc=None):
+    def out(self, code, body, loc=None, cookie=None, retry=None):
         b = body.encode()
         self.send_response(code)
         if loc:
             self.send_header("Location", loc)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        if retry is not None:
+            self.send_header("Retry-After", str(retry))
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
@@ -179,6 +230,82 @@ class H(BaseHTTPRequestHandler):
             if p.startswith("/path/"):
                 rows = q("SELECT name FROM items WHERE id=" + unquote(p[6:]))
                 return self.out(200, self.page("".join("<p>%s</p>" % r[0] for r in rows) or "none"))
+            # ── ここから下は、安全性と誤検知の回帰テスト用 ──
+            if p == "/dump":        # テスト用: テーブルの中身を返す（注入点ではない）
+                t = g.get("t", "")
+                if t not in TABLES:
+                    return self.out(404, "nope")
+                rows = q("SELECT * FROM %s ORDER BY %s" % (t, ORDER[t]))
+                return self.out(200, json.dumps([list(r) for r in rows]))
+            if p == "/reset":       # テスト用: 初期データに戻す
+                setup()
+                SESSIONS.clear()
+                return self.out(200, "reset")
+            if p == "/list":        # 複数行・複数列の一覧（列によって並び順が変わる）
+                rows = q("SELECT id,name,price FROM products WHERE cat=" + g.get("cat", "1"))
+                return self.out(200, self.page("".join("<p>%s: %s yen</p>" % (r[1], r[2]) for r in rows) or "no item"))
+            if p == "/group":       # GROUP BY 句への注入
+                rows = q("SELECT name, COUNT(*) FROM items GROUP BY " + g.get("by", "name"))
+                return self.out(200, self.page("".join("<li>%s</li>" % r[0] for r in sorted(str(x[0]) for x in rows))))
+            if p == "/updmulti":    # UPDATE の文字列値。; で区切った先頭の文を実行してしまう実装
+                q_multi("UPDATE notes SET body='%s' WHERE id=2" % f.get("note", ""))
+                return self.out(200, self.page("saved"))
+            if p == "/resetpw":     # UPDATE ... WHERE に文字列が入る
+                q("UPDATE users SET password='%s' WHERE username='%s'" % (f.get("newpw", ""), f.get("user", "")))
+                return self.out(200, self.page("changed"))
+            if p == "/logout":      # DELETE ... WHERE に文字列。エラー握り潰し
+                try:
+                    q("DELETE FROM sessions WHERE token='%s'" % f.get("token", ""))
+                except Exception:
+                    pass
+                return self.out(200, self.page("bye"))
+            if p == "/delin":       # DELETE ... WHERE id IN (数値の並び)。エラー握り潰し
+                try:
+                    q("DELETE FROM notes WHERE id IN (%s)" % f.get("ids", ""))
+                except Exception:
+                    pass
+                return self.out(200, self.page("deleted"))
+            if p == "/delnum":      # DELETE ... WHERE id=数値
+                q("DELETE FROM notes WHERE id=%s" % f.get("id", ""))
+                return self.out(200, self.page("deleted"))
+            if p == "/rawcookie":   # Cookie を URL デコードしない実装（Python / Go / Java など）
+                ck = dict(x.strip().split("=", 1) for x in self.headers.get("Cookie", "").split(";") if "=" in x)
+                rows = q("SELECT name FROM items WHERE name='%s'" % ck.get("track", ""))
+                return self.out(200, self.page("known" if rows else "unknown"))
+            if p == "/slogin":      # 成功するとセッション Cookie を出し、Cookie があれば常にログイン済み扱い
+                ck = dict(x.strip().split("=", 1) for x in self.headers.get("Cookie", "").split(";") if "=" in x)
+                if ck.get("sid") in SESSIONS:
+                    return self.out(302, "", "/home")
+                try:
+                    rows = q("SELECT id FROM users WHERE username='%s' AND password='%s'"
+                             % (f.get("user", ""), f.get("pass", "")))
+                except Exception:
+                    return self.out(500, "Internal Server Error")
+                if not rows:
+                    return self.out(200, self.page("Login failed"))
+                sid = "%032x" % random.getrandbits(128)
+                SESSIONS.add(sid)
+                return self.out(302, "", "/home", cookie="sid=" + sid)
+            if p == "/lookup":      # 安全（プレースホルダ）。20 文字を超える入力は 400
+                if len(g.get("code", "")) > 20:
+                    return self.out(400, "too long")
+                q("SELECT name FROM items WHERE name=" + PH, (g.get("code", ""),))
+                return self.out(200, self.page("code ok"))
+            if p == "/noise":       # 安全。入力を無視し、毎回ちがう件数の項目を出す
+                n = random.randint(0, 6)
+                return self.out(200, self.page("".join("<li>related %d</li>" % random.randint(1, 9) for _ in range(n))))
+            if p == "/taut":        # 安全。1=1 のような「同じ数字 = 同じ数字」を見たら 403（WAF のまね）
+                if re.search(r"(\d+)\s*=\s*\1\b", g.get("id", "")):
+                    return self.out(403, "Forbidden")
+                q("SELECT name FROM items WHERE name=" + PH, (g.get("id", ""),))
+                return self.out(200, self.page("item one"))
+            if p == "/always429":   # 最初からレート制限されている対象
+                return self.out(429, "Too Many Requests", retry=0)
+            if p == "/parser":      # DB を使わない検索。クォートの数が合わないと「syntax error」と言うだけ
+                v = g.get("q", "")
+                if v.count("'") % 2 or v.count('"') % 2 or v.count("(") != v.count(")"):
+                    return self.out(200, self.page("Your search query has a syntax error."))
+                return self.out(200, self.page("0 results"))
             if p == "/waf":         # クォートを見たら 403 を返す（WAF のまね）
                 if "'" in g.get("id", "") or " " in g.get("id", ""):
                     return self.out(403, "Forbidden")

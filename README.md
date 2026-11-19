@@ -26,7 +26,7 @@ python3 sqljr.py -u "http://victim/item?id=1" -o result.json --log req.jsonl
 
 | | GET / HEAD | それ以外（POST など） |
 |---|---|---|
-| `--risk 1`（既定） | AND 型、値を変えない式、コメント（`-- -` / `#`）、`ORDER BY`、`UNION`、MSSQL の `WAITFOR` | **値を変えない式**だけ（MySQL の文字列だけは下記の AND） |
+| `--risk 1`（既定） | AND 型、値を変えない式、コメント（`-- -` / `#`）、`ORDER BY`、`UNION`、MSSQL の `WAITFOR` | **値を変えない式**だけ |
 | `--risk 2` | 上に加えて OR 型、PostgreSQL のスタッククエリ、SQLite の `RANDOMBLOB` 負荷 | GET の `--risk 2` と同じものを全部 |
 
 既定で GET 以外に送らないものと、その理由です。どれも、注入先が `UPDATE` / `DELETE` だったときに狙った行以外へ効きます。
@@ -47,24 +47,27 @@ python3 sqljr.py -u "http://victim/item?id=1" -o result.json --log req.jsonl
 
 文字列の連結は DBMS ごとに書き方が違い、MySQL では `||` が OR になります（`WHERE name='v'||…||'' AND owner=7` の `AND owner=7` が外れ、他人の行に一致する）。そのため連結形には `pg_backend_pid()` / `sqlite_version()` / `ORA_HASH()` / `@@SPID` のようにその DBMS にしか無いものを入れ、ほかの DBMS では実行前のエラーで止まるようにしています。
 
-MySQL / MariaDB には文字列の位置で値を変えない式が無いので、MySQL でしか動かない AND を使います。
+MySQL / MariaDB には文字列の位置で値を変えない式が無いので、クォートを閉じたあと「比較の結果」に式をつなぎます。MySQL でしか動かない形です。
 
 ```
-abc' AND @@sql_mode IS NOT NULL AND 条件 AND 'a'='a
+abc'=(SELECT '1' FROM DUAL WHERE @@sql_mode IS NOT NULL AND (条件)) AND 'a'='a
+→ WHERE ((name='abc') = '1') AND 'a'='a' AND owner=7
+  条件が真なら副問い合わせは '1' で、元の比較と同じ（後ろの条件も残る）。偽なら NULL で 0 行
 ```
 
-AND は値が括弧の中（`IN ('abc')`、`LOWER('abc')` など）にあると 0 / 1 に化けるので、括弧を 2 つ閉じる形、1 つ閉じる形、閉じない形の順に試し、構文として通った深さで打ち切ります。括弧を閉じすぎた形は構文エラーで止まるだけです。
+boolean では「条件」の部分を、偽のとき SQL エラーになる式にします。エラーにする部分を副問い合わせの内側に置いてあるので、`DELETE IGNORE` / `UPDATE IGNORE` がエラーを握り潰しても、元と同じか 0 行にしかなりません。
 
-これで分かるのは「条件が偽のときにエラーになるか」（MySQL の文字列は「条件で結果が変わるか」）なので、それが画面にもステータスにも出ない対象では boolean を検出できません。time は同じ形に遅延を埋め込んで調べます。
+この式は、値が括弧の中（`IN ('abc')`、`LOWER('abc')` など）にあると値の一部になってしまうので、括弧を 2 つ閉じる形、1 つ閉じる形、閉じない形の順に試し、構文として通った深さで打ち切ります。括弧を閉じすぎた形は構文エラーで止まるだけです。
+
+これで分かるのは「条件が偽のときにエラーになるか」なので、SQL エラーが画面にもステータスにも出ない対象では boolean を検出できません。time は同じ形に遅延を埋め込んで調べます。
 
 注意点:
 
-- ログインフォーム（元値が無効な入力）の boolean は、OR 型でないと検出できないことが多いです（MySQL / PostgreSQL / Oracle では既定だと QUOTE か time まで）。`--risk 2` を付けてください。
-- MySQL / MariaDB の更新・削除フォームは、既定では boolean ではなく time で見つかるのが普通です（真でも偽でも画面が同じため）。
+- ログインフォーム（元値が無効な入力）は、PostgreSQL / Oracle では OR 型でないと boolean を検出できません（既定だと QUOTE まで）。`--risk 2` を付けてください。MySQL / SQLite / MSSQL は、SQL エラーが 500 などで見える対象なら既定でも見つかります。
 - 検索など参照系と分かっている POST も、`--risk 2` で UNION まで調べられます。
 - GET で更新・削除する作りの対象には使わないでください。GET にはコメントも送るので、入力が `SET` 句に入る `UPDATE` だと全行が書き換わります。
 - 登録・更新系のエンドポイントは、どの risk でも検査のたびに行が書き込まれます（狙った行は更新・削除されます）。
-- 既定でも残る危険: MySQL / MariaDB で、文字列の値が 3 重以上の括弧・関数の中にある `UPDATE` / `DELETE`（`IN (LOWER(TRIM('入力')))` など）。AND が値の位置に入り、別の行に効きます。書き込み系のエンドポイントは、壊れてもよい環境で検査してください。
+- 既定でも残る危険: MySQL / MariaDB で、文字列の値が 3 重以上の括弧・関数の中にある `UPDATE` / `DELETE`（`IN (LOWER(TRIM('入力')))` など）。式が値の位置に入り、別の行に効きます。書き込み系のエンドポイントは、壊れてもよい環境で検査してください。
 - 提示するコマンドも同じ基準です。GET 以外・`--risk 1` では、コメントで後続を消す形（UNION、スタッククエリ、認証バイパス）は提示しません。
 
 ## 検出できる文脈
@@ -104,7 +107,7 @@ UNION は、`UNION ALL SELECT NULL,…` の列数を変えると応答が変わ�
 - 改行をまたぐ SQL での UNION と MSSQL の time（行コメントでは次の行を消せない）
 - MSSQL の GROUP BY 句での boolean、Oracle の GROUP BY 句での time（どちらも副問い合わせを書けない場所）
 - MSSQL の INSERT / UPDATE 値での time（式の中で遅延できない）
-- ログインフォームの boolean は、MySQL / PostgreSQL / Oracle では `--risk 2` が必要（元の値が 1 行にも一致しないので AND では差が出ず、埋め込んだ式も評価されない）
+- ログインフォームの boolean は、PostgreSQL / Oracle では `--risk 2` が必要（元の値が 1 行にも一致しないと、埋め込んだ式が評価されない）
 - Oracle / SQLite の time は「重い処理」なので、対象が速いと閾値（0.5 秒）に届かず見逃すことがあります
 - WAF 越し。遮断（403 / 406 / 429 / 503）を検知したら警告しますが、回避は `--tamper` の最低限だけです
 
@@ -136,4 +139,4 @@ VULN_MSSQL_PASSWORD='...' python3 tests/vuln_app.py mssql 8104 &
 SQLJR_TEST_URL=http://127.0.0.1:8104 SQLJR_TEST_DBMS=MSSQL python3 -m unittest discover -s tests -v
 ```
 
-`vuln_app.py` のバックエンドは `sqlite` / `pg` / `mysql` / `mssql` / `oracle` です。接続先は `VULN_*` 環境変数で指定します（ファイル冒頭を参照）。ドライバは `psycopg2-binary` / `pymysql` / `pymssql` / `oracledb` です。Oracle は DBA ではない一般ユーザ（`VULN_ORACLE_USER`）でも回してください。`DBMS_PIPE` を使えない状況になります。
+`vuln_app.py` のバックエンドは `sqlite` / `pg` / `mysql` / `mssql` / `oracle` です。接続先は `VULN_*` 環境変数で指定します（ファイル冒頭を参照）。MySQL は `VULN_MYSQL_HOST` / `VULN_MYSQL_PORT` を指定すると TCP で接続します。MariaDB と MySQL 8 では式の評価のされ方が違うので、両方で回してください。ドライバは `psycopg2-binary` / `pymysql` / `pymssql` / `oracledb` です。Oracle は DBA ではない一般ユーザ（`VULN_ORACLE_USER`）でも回してください。`DBMS_PIPE` を使えない状況になります。

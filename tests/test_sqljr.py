@@ -313,9 +313,7 @@ class Safety(Base):
             self.assertNotIn("UNION ALL SELECT NULL", p)
             self.assertNotIn(" OR ", p)
             self.assertNotIn("ORDER BY", p)
-            # AND 型は値が括弧の中だと別の行に効く。送ってよいのは MySQL でしか動かない形だけ
-            if re.match(r"""^['")]* AND """, p):
-                self.assertIn("@@sql_mode", p)
+            self.assertIsNone(re.match(r"""^['")]* AND """, p), p)          # AND 型は値が括弧の中だと別の行に効く
 
     def test_no_tail_cutting_suggestions_on_post_by_default(self):
         """ツールが送らなかった種類のペイロード（' OR 1=1-- - など）を「次の一手」として勧めない。"""

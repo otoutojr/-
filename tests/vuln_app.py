@@ -133,6 +133,22 @@ def setup():
             q(stmt)
 
 
+def reset_data():
+    """/reset 用: 表は作り直さず、行だけ初期状態に戻す。DROP / CREATE は、直前のリクエストの文がまだ表を
+       つかんでいると失敗する（Oracle の ORA-00054）ので、待てば済む DELETE と INSERT で行う。"""
+    for t in TABLES:
+        q("DELETE FROM %s" % t)
+    for stmt in SETUP:
+        if not stmt.startswith("INSERT"):
+            continue
+        if KIND == "oracle" and "),(" in stmt:
+            head, _, vals = stmt.partition(" VALUES ")
+            for v in vals[1:-1].split("),("):
+                q("%s VALUES (%s)" % (head, v))
+        else:
+            q(stmt)
+
+
 setup()
 SESSIONS = set()            # /slogin が発行したセッション Cookie
 
@@ -242,7 +258,7 @@ class H(BaseHTTPRequestHandler):
                 rows = q("SELECT * FROM %s ORDER BY %s" % (t, ORDER[t]))
                 return self.out(200, json.dumps([list(r) for r in rows]))
             if p == "/reset":       # テスト用: 初期データに戻す
-                setup()
+                reset_data()
                 SESSIONS.clear()
                 return self.out(200, "reset")
             if p == "/list":        # 複数行・複数列の一覧（列によって並び順が変わる）
@@ -286,6 +302,15 @@ class H(BaseHTTPRequestHandler):
                 return self.out(200, self.page("deleted"))
             if p == "/delnest":     # 数値が括弧と関数の中
                 q("DELETE FROM notes WHERE id IN (ABS(%s))" % f.get("ids", ""))
+                return self.out(200, self.page("deleted"))
+            if p == "/purge":       # 値の後ろに掛け算が続く（「N 日より古いものを消す」の形）
+                q("DELETE FROM products WHERE price > %s*100" % f.get("over", ""))
+                return self.out(200, self.page("deleted"))
+            if p == "/delin2":      # クォートされた値の後ろに、IN の並びの次の要素が続く
+                q("DELETE FROM notes WHERE id IN ('%s','4')" % f.get("ids", ""))
+                return self.out(200, self.page("deleted"))
+            if p == "/between":     # クォートされた値が BETWEEN の下限
+                q("DELETE FROM products WHERE price BETWEEN '%s' AND '300'" % f.get("lo", ""))
                 return self.out(200, self.page("deleted"))
             if p == "/delnum":      # DELETE ... WHERE id=数値
                 q("DELETE FROM notes WHERE id=%s" % f.get("id", ""))

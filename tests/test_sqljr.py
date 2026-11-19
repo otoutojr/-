@@ -124,11 +124,11 @@ class Detection(Base):
         self.assertIn("BOOL", pt["techniques"])
 
     def test_numeric_post_without_bare_and(self):
-        """POST の数値は、既定では「<値>-(CASE ... THEN 0 ...)」の形で調べる（素の AND は送らない）。"""
+        """POST の数値は、既定では「<値>*(CASE WHEN … THEN 1 … END)」の形で調べる（素の AND は送らない）。"""
         pt = self.point("/api", "-d", '{"id":1}', "-t", "B")
         self.assertIn("BOOL", pt["techniques"])
         self.assertEqual(pt["boundary"]["op"], "")
-        self.assertTrue(pt["boundary"]["prefix"].startswith("-(CASE"))
+        self.assertTrue(pt["boundary"]["prefix"].startswith("*(CASE WHEN ("))      # 元の値に 1 を掛ける形
 
     def test_order_by_context(self):
         """ORDER BY 句への注入。SQLite は「複数行の副問い合わせ」がエラーにならないので専用の式が要る。"""
@@ -298,6 +298,17 @@ class Safety(Base):
     def test_number_inside_nested_parentheses(self):
         """IN (ABS(<値>))。括弧を閉じる AND は IN (ABS(3) AND 1=1 AND (7=7)) になる。"""
         self.check("/delnest", "ids=3", "notes", [3])
+
+    def test_number_followed_by_multiplication(self):
+        """price > <値>*100。後ろに足す形「5-(0)」は 5-(0)*100 = 5 になり、消える行が増える。"""
+        self.check("/purge", "over=5", "products", [3])
+
+    def test_quoted_value_followed_by_another_list_element(self):
+        """IN ('<値>','4')。括弧を 1 つ閉じる形が通らないと、値の位置に式が入って別の行に効く。"""
+        self.check("/delin2", "ids=3", "notes", [3, 4])
+
+    def test_quoted_value_as_between_bound(self):
+        self.check("/between", "lo=200", "products", [1])
 
     def test_no_tail_cutting_payloads_on_post_by_default(self):
         log = os.path.join(self.tmp, "req.jsonl")

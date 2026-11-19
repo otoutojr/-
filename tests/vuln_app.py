@@ -265,6 +265,24 @@ class H(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 return self.out(200, self.page("deleted"))
+            if p == "/delowner":    # 値の後ろに別の条件が続く（所有者での絞り込み）。元の値では 1 行も消えない
+                q("DELETE FROM products WHERE name='%s' AND cat=2" % f.get("name", ""))
+                return self.out(200, self.page("deleted"))
+            if p == "/delsuffix":   # 値の後ろに文字が足される
+                q("DELETE FROM sessions WHERE token='%s-old'" % f.get("token", ""))
+                return self.out(200, self.page("deleted"))
+            if p == "/delq":        # クォートされた値が IN (...) の中。エラー握り潰し
+                try:
+                    q("DELETE FROM notes WHERE id IN ('%s')" % f.get("ids", ""))
+                except Exception:
+                    pass
+                return self.out(200, self.page("deleted"))
+            if p == "/delfn":       # クォートされた値が関数の引数
+                q("DELETE FROM sessions WHERE token=LOWER('%s')" % f.get("token", ""))
+                return self.out(200, self.page("deleted"))
+            if p == "/delnest":     # 数値が括弧と関数の中
+                q("DELETE FROM notes WHERE id IN (ABS(%s))" % f.get("ids", ""))
+                return self.out(200, self.page("deleted"))
             if p == "/delnum":      # DELETE ... WHERE id=数値
                 q("DELETE FROM notes WHERE id=%s" % f.get("id", ""))
                 return self.out(200, self.page("deleted"))

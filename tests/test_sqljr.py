@@ -8,6 +8,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -280,6 +281,24 @@ class Safety(Base):
     def test_delete_where_number(self):
         self.check("/delnum", "id=3", "notes", [3])
 
+    def test_condition_after_the_value(self):
+        """WHERE name='<値>' AND cat=2。MySQL で '||(…)||' を使うと OR になり、後ろの条件が外れて他の行が消える。"""
+        self.check("/delowner", "name=pear", "products", [])
+
+    def test_text_appended_to_the_value(self):
+        self.check("/delsuffix", "token=tok-alice", "sessions", [])
+
+    def test_quoted_value_inside_in_list(self):
+        """IN ('<値>')。クォートを閉じ直す AND は IN ('3' AND 1=1 …) = IN (1) になり、別の ID の行が消える。"""
+        self.check("/delq", "ids=3", "notes", [3])
+
+    def test_quoted_value_inside_function(self):
+        self.check("/delfn", "token=tok-alice", "sessions", ["tok-alice"])
+
+    def test_number_inside_nested_parentheses(self):
+        """IN (ABS(<値>))。括弧を閉じる AND は IN (ABS(3) AND 1=1 AND (7=7)) になる。"""
+        self.check("/delnest", "ids=3", "notes", [3])
+
     def test_no_tail_cutting_payloads_on_post_by_default(self):
         log = os.path.join(self.tmp, "req.jsonl")
         for path, data in (("/upd", "note=hello"), ("/delnum", "id=3"), ("/resetpw", "user=alice&newpw=x")):
@@ -294,7 +313,9 @@ class Safety(Base):
             self.assertNotIn("UNION ALL SELECT NULL", p)
             self.assertNotIn(" OR ", p)
             self.assertNotIn("ORDER BY", p)
-            self.assertFalse(p.startswith(" AND "), p)                      # 素の AND（IN の並びで別の ID になる）
+            # AND 型は値が括弧の中だと別の行に効く。送ってよいのは MySQL でしか動かない形だけ
+            if re.match(r"""^['")]* AND """, p):
+                self.assertIn("@@sql_mode", p)
 
     def test_no_tail_cutting_suggestions_on_post_by_default(self):
         """ツールが送らなかった種類のペイロード（' OR 1=1-- - など）を「次の一手」として勧めない。"""
